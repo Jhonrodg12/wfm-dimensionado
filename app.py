@@ -239,7 +239,46 @@ for k in sorted(S["xc"], key=lambda x: (int(x.split("_")[0]), int(x.split("_")[1
 st.dataframe(pd.DataFrame(filas, columns=["País", "Inicio", "Fin", "Cantidad", "Días libres"]),
              use_container_width=True)
 
-st.subheader("5) Descargar")
+st.subheader("5) Comparar con tu plantilla actual (opcional)")
+ag = st.file_uploader("Sube tu Excel de agentes (con columnas MODO, CENTRO, ESTADO…)",
+                      type=["xlsx", "xls"], key="agentes")
+if ag is not None:
+    A = pd.read_excel(ag)
+    if "ESTADO" in A.columns:
+        A = A[A["ESTADO"].astype(str).str.upper() == "ACTIVO"]
+    if "MODO" in A.columns:
+        modos = sorted(A["MODO"].dropna().astype(str).unique())
+        default = ["MULTISKILL"] if "MULTISKILL" in modos else modos
+        sel = st.multiselect("Skill(s) a contar (MODO)", modos, default=default)
+        if sel:
+            A = A[A["MODO"].astype(str).isin(sel)]
+    if "CENTRO" in A.columns:
+        A["pais"] = A["CENTRO"].astype(str).str.upper().apply(
+            lambda c: "España" if c in ("SEVILLA", "BARCELONA") else "Colombia")
+        act_e = int((A["pais"] == "España").sum())
+        act_c = int((A["pais"] == "Colombia").sum())
+    else:
+        act_e, act_c = 0, len(A)
+
+    def nomina(x):
+        return math.ceil(x / (1 - ABS))
+
+    comp = pd.DataFrame({
+        "País": ["España", "Colombia", "TOTAL"],
+        "Requerido (presentes)": [S["te"], S["tc"], S["te"] + S["tc"]],
+        "Necesarios en nómina (+abs)": [nomina(S["te"]), nomina(S["tc"]), nomina(S["te"]) + nomina(S["tc"])],
+        "Agentes actuales": [act_e, act_c, act_e + act_c],
+    })
+    comp["Gap (actual − nómina)"] = comp["Agentes actuales"] - comp["Necesarios en nómina (+abs)"]
+    st.dataframe(comp, use_container_width=True)
+    g = int(comp.iloc[2]["Gap (actual − nómina)"])
+    if g >= 0:
+        st.success(f"Tienes {g} agentes de margen sobre lo necesario en nómina.")
+    else:
+        st.warning(f"Te faltan {-g} agentes respecto a lo necesario en nómina.")
+    st.caption("Centros: SEVILLA y BARCELONA → España; el resto → Colombia. Ajusta si tienes otros centros.")
+
+st.subheader("6) Descargar")
 st.download_button("⬇️ Roster en Excel (con gráficos)",
                    build_excel(S, turnos, (AHT, SLA, ASA, OCC, UTL, ABS)),
                    file_name="roster.xlsx",
