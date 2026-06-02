@@ -37,14 +37,6 @@ LARGO = int(st.sidebar.number_input("Duración turno (h)", 6, 12, 9, 1))
 
 @st.cache_data(show_spinner="Dimensionando y optimizando turnos…")
 def resolver(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
-    def agentes(carga):
-        if carga <= 0:
-            return 0
-        a = int(carga) + 1
-        while nivel_servicio(a, carga, AHT, ASA) < SLA:
-            a += 1
-        return math.ceil(max(a, math.ceil(carga / OCC)) / UTL)
-
     raw = pd.read_excel(io.BytesIO(file_bytes))
     fechas = raw.iloc[0]
     first = raw.columns[0]
@@ -65,9 +57,22 @@ def resolver(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
     L = L[(L["intervalo"] >= 0) & (L["intervalo"] <= 23)]
     L["dow"] = L["fecha"].dt.dayofweek
 
-    peak = {dw: [0] * 24 for dw in range(7)}
+    volmax = {dw: [0.0] * 24 for dw in range(7)}
     for (dw, h), g in L.groupby(["dow", "intervalo"]):
-        peak[dw][h] = max(agentes(v * AHT / 3600) for v in g["vol"])
+        volmax[dw][h] = float(g["vol"].max())
+    peak = {dw: [0] * 24 for dw in range(7)}
+    occ = {dw: [0.0] * 24 for dw in range(7)}
+    for dw in range(7):
+        for h in range(24):
+            ca = volmax[dw][h] * AHT / 3600
+            if ca <= 0:
+                continue
+            a = int(ca) + 1
+            while nivel_servicio(a, ca, AHT, ASA) < SLA:
+                a += 1
+            en_linea = max(a, math.ceil(ca / OCC))
+            peak[dw][h] = math.ceil(en_linea / UTL)
+            occ[dw][h] = ca / en_linea
 
     H = 24
     turnos = {ini: [(ini + k) % H for k in range(LARGO)] for ini in range(H)}
@@ -99,7 +104,7 @@ def resolver(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
         ss = cp_model.CpSolver(); ss.Solve(mm)
         return sum(ss.Value(v) for v in xx.values())
     cw = max(crew(peak[5]), crew(peak[6]))
-    return {"peak": peak, "xe": xe_s, "xc": xc_s, "te": te, "tc": tc, "crew": cw, "rot": cw * 4 // 2}
+    return {"peak": peak, "occ": occ, "xe": xe_s, "xc": xc_s, "te": te, "tc": tc, "crew": cw, "rot": cw * 4 // 2}
 
 def turnos_dict(largo):
     return {ini: [(ini + k) % 24 for k in range(largo)] for ini in range(24)}
@@ -228,6 +233,17 @@ ax.bar(range(24), req, color="#C9D6D3", label="Requerido")
 ax.step(range(24), cob, where="mid", color="#1F6F66", linewidth=2, label="Programado")
 ax.set_xlabel("Hora"); ax.set_ylabel("Agentes"); ax.set_xticks(range(0, 24, 2)); ax.legend()
 st.pyplot(fig)
+
+st.markdown("**Ocupación por hora**")
+occv = [S["occ"][dsel][h] * 100 for h in range(24)]
+fig2, ax2 = plt.subplots(figsize=(10, 3))
+colors = ["#E76F51" if o < 30 else ("#E9C46A" if o < OCC * 100 * 0.85 else "#2A9D8F") for o in occv]
+ax2.bar(range(24), occv, color=colors)
+ax2.axhline(OCC * 100, color="#264653", linestyle="--", linewidth=1, label=f"Objetivo OCC {OCC:.0%}")
+ax2.set_xlabel("Hora"); ax2.set_ylabel("Ocupación %"); ax2.set_xticks(range(0, 24, 2))
+ax2.set_ylim(0, 100); ax2.legend()
+st.pyplot(fig2)
+st.caption("Rojo = horas de baja ocupación (poca demanda, agentes casi ociosos). La línea marca tu objetivo de OCC.")
 
 st.subheader("4) Plan de turnos")
 filas = []
