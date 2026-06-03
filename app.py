@@ -1,4 +1,5 @@
 import io, math
+import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -43,6 +44,79 @@ def nivel_atencion(ag, carga, aht, pac, NMAX=250):
     S = sum(p)
     aband = sum(p[n] * max(0, (n - ag)) * theta for n in range(len(p))) / S
     return 1 - aband / lam
+
+
+# ---------------- Selector de vista ----------------
+vista = st.sidebar.radio("Vista", ["Planificación (pronóstico y roster)", "Dashboard histórico"])
+
+if vista == "Dashboard histórico":
+    st.header("📊 Dashboard histórico por cola")
+    upd = st.file_uploader("Sube el agregado por cola (CSV: fecha, cola, entrantes, atendidas, abandonadas)",
+                           type=["csv"], key="dash")
+    if upd is None:
+        st.info("Sube el archivo agregado por cola para ver el dashboard.")
+        st.stop()
+    d = pd.read_csv(upd)
+    d.columns = [c.strip().lower() for c in d.columns]
+    d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce")
+    d = d.dropna(subset=["fecha"])
+    for c in ["entrantes", "atendidas", "abandonadas"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    d["año"] = d["fecha"].dt.year
+    d["mes"] = d["fecha"].dt.month
+    d["semana"] = d["fecha"].dt.isocalendar().week.astype(int)
+    d["dow"] = d["fecha"].dt.dayofweek
+
+    f1, f2, f3, f4 = st.columns(4)
+    año = f1.selectbox("Año", ["Todos"] + sorted(d["año"].unique()))
+    mes = f2.selectbox("Mes", ["Todos"] + list(range(1, 13)))
+    sem = f3.selectbox("Semana ISO", ["Todas"] + sorted(d["semana"].unique()))
+    dias_sel = f4.multiselect("Día de semana", NOM, default=NOM)
+    colas = st.multiselect("Colas", sorted(d["cola"].unique()), default=sorted(d["cola"].unique()))
+
+    f = d.copy()
+    if año != "Todos":
+        f = f[f["año"] == año]
+    if mes != "Todos":
+        f = f[f["mes"] == mes]
+    if sem != "Todas":
+        f = f[f["semana"] == sem]
+    f = f[f["dow"].isin([NOM.index(x) for x in dias_sel])]
+    f = f[f["cola"].isin(colas)]
+    if f.empty:
+        st.warning("No hay datos para esos filtros.")
+        st.stop()
+
+    ent, at, ab = f["entrantes"].sum(), f["atendidas"].sum(), f["abandonadas"].sum()
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Entrantes", f"{int(ent):,}")
+    k2.metric("Atendidas", f"{int(at):,}")
+    k3.metric("Abandonadas", f"{int(ab):,}")
+    k4.metric("% Atención", f"{at / ent * 100:.1f}%" if ent else "—")
+
+    st.subheader("Por cola")
+    by = f.groupby("cola")[["entrantes", "atendidas", "abandonadas"]].sum().reset_index()
+    by["% atención"] = (by["atendidas"] / by["entrantes"].replace(0, np.nan) * 100).round(1)
+    by = by.sort_values("entrantes", ascending=False)
+    st.dataframe(by, use_container_width=True)
+
+    x = np.arange(len(by)); w = 0.4
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(x - w / 2, by["atendidas"], w, label="Atendidas", color="#2A9D8F")
+    ax.bar(x + w / 2, by["abandonadas"], w, label="Abandonadas", color="#E76F51")
+    ax.set_xticks(x); ax.set_xticklabels(by["cola"], rotation=30, ha="right"); ax.legend()
+    ax.set_ylabel("Llamadas")
+    st.pyplot(fig)
+
+    st.subheader("% Atención en el tiempo")
+    serie = f.groupby("fecha")[["entrantes", "atendidas"]].sum()
+    serie["pat"] = serie["atendidas"] / serie["entrantes"].replace(0, np.nan) * 100
+    fig2, ax2 = plt.subplots(figsize=(10, 3))
+    ax2.plot(serie.index, serie["pat"], color="#1F6F66", linewidth=1.5)
+    ax2.axhline(96, color="#E76F51", linestyle="--", linewidth=1, label="Objetivo 96%")
+    ax2.set_ylabel("% Atención"); ax2.legend()
+    st.pyplot(fig2)
+    st.stop()
 
 
 # ---------------- Parámetros ----------------
