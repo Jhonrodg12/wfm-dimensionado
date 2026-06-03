@@ -102,8 +102,8 @@ def largo_desde_crosstab(file_bytes):
     d = raw.drop(index=0)
     d = d[d[first].astype(str).str.lower() != "total"].rename(columns={first: "intervalo"})
     L = d.melt(id_vars="intervalo", var_name="col", value_name="volumen")
-    L["fecha"] = L["col"].map(fechas)
-    L = L[L["fecha"].apply(lambda x: isinstance(x, pd.Timestamp))]
+    L["fecha"] = pd.to_datetime(L["col"].map(fechas), errors="coerce")
+    L = L.dropna(subset=["fecha"])
     L["volumen"] = pd.to_numeric(L["volumen"], errors="coerce")
     L = L.dropna(subset=["volumen"])
 
@@ -118,18 +118,21 @@ def largo_desde_crosstab(file_bytes):
 
 
 def largo_desde_historico(file_bytes, mes, scope, K, semanas):
-    H = pd.read_excel(io.BytesIO(file_bytes), sheet_name="HISTORICO", header=2)
-    H["Fecha"] = pd.to_datetime(H["Fecha"], errors="coerce")
-    H["Entrantes"] = pd.to_numeric(H["Entrantes"], errors="coerce").fillna(0)
-    H = H.dropna(subset=["Fecha"])
-    hh = H.groupby([H["Fecha"].dt.normalize(), "Hora"])["Entrantes"].sum().reset_index()
-    hh.columns = ["fecha", "hora", "vol"]
+    # Histórico AGREGADO y liviano (CSV: fecha, hora, vol)
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    df.columns = [c.strip().lower() for c in df.columns]
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df["hora"] = pd.to_numeric(df["hora"], errors="coerce")
+    df["vol"] = pd.to_numeric(df["vol"], errors="coerce").fillna(0)
+    df = df.dropna(subset=["fecha", "hora"])
+    df["hora"] = df["hora"].astype(int)
+    hh = df[["fecha", "hora", "vol"]]
     dia = hh.groupby("fecha")["vol"].sum()
 
     if scope == "Cataluña (Barcelona)":
-        ES = holidays.Spain(years=range(2024, 2028), subdiv="CT")
+        ES = holidays.Spain(years=range(2023, 2028), subdiv="CT")
     else:
-        ES = holidays.Spain(years=range(2024, 2028))
+        ES = holidays.Spain(years=range(2023, 2028))
 
     def fest(t):
         return t.date() in ES
@@ -281,7 +284,9 @@ modo = st.radio("¿Cómo obtenemos el pronóstico?",
 
 S = None
 if modo == "Generar desde histórico":
-    up = st.file_uploader("Sube tu Excel con la hoja HISTORICO", type=["xlsm", "xlsx"])
+    up = st.file_uploader("Sube tu histórico agregado (CSV con columnas: fecha, hora, vol)", type=["csv"])
+    st.caption("¿No tienes el agregado? Genéralo una vez en Colab a partir del histórico crudo "
+               "(suma de Entrantes por fecha y hora). El archivo crudo de 95 MB es demasiado pesado para la web.")
     c1, c2, c3, c4 = st.columns(4)
     mes = c1.text_input("Mes (AAAA-MM)", "2026-06")
     scope = c2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
