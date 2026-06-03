@@ -31,6 +31,20 @@ def nivel_servicio(a, c, aht, asa):
     return 0.0 if a <= c else 1 - erlang_c(a, c) * math.exp(-(a - c) * asa / aht)
 
 
+def nivel_atencion(ag, carga, aht, pac, NMAX=250):
+    # Erlang A (con abandono): fracción de llamadas atendidas (no abandonadas)
+    if carga <= 0:
+        return 1.0
+    lam = carga / aht; mu = 1.0 / aht; theta = 1.0 / pac
+    p = [1.0]
+    for n in range(1, NMAX + 1):
+        muerte = n * mu if n <= ag else ag * mu + (n - ag) * theta
+        p.append(p[-1] * lam / muerte)
+    S = sum(p)
+    aband = sum(p[n] * max(0, (n - ag)) * theta for n in range(len(p))) / S
+    return 1 - aband / lam
+
+
 # ---------------- Parámetros ----------------
 st.sidebar.header("Parámetros")
 AHT = st.sidebar.number_input("AHT (seg)", 60, 1200, 420, 10)
@@ -41,10 +55,12 @@ UTL = st.sidebar.slider("Utilización (UTL)", 0.60, 1.00, 0.88, 0.01)
 ABS = st.sidebar.slider("Absentismo", 0.00, 0.40, 0.15, 0.01)
 ESP_MAX = st.sidebar.number_input("Agentes España (máx, solo L–V)", 0, 200, 12, 1)
 LARGO = int(st.sidebar.number_input("Duración turno (h)", 6, 12, 9, 1))
+NDA_OBJ = st.sidebar.slider("NDA objetivo (nivel de atención)", 0.80, 0.999, 0.96, 0.005)
+PACIENCIA = st.sidebar.number_input("Paciencia media (seg)", 20, 600, 90, 10)
 
 
 # ---------------- Núcleo: dimensionar + roster ----------------
-def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
+def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA):
     largo = largo.copy()
     largo["dow"] = pd.to_datetime(largo["fecha"]).dt.dayofweek
     volmax = {dw: [0.0] * 24 for dw in range(7)}
@@ -52,6 +68,7 @@ def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
         volmax[dw][int(h)] = float(g["volumen"].max())
     peak = {dw: [0] * 24 for dw in range(7)}
     occ = {dw: [0.0] * 24 for dw in range(7)}
+    nda = {dw: [1.0] * 24 for dw in range(7)}
     for dw in range(7):
         for h in range(24):
             ca = volmax[dw][h] * AHT / 3600
@@ -61,8 +78,11 @@ def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
             while nivel_servicio(a, ca, AHT, ASA) < SLA:
                 a += 1
             en = max(a, math.ceil(ca / OCC))
+            while nivel_atencion(en, ca, AHT, PACIENCIA) < NDA_OBJ:   # piso por NDA
+                en += 1
             peak[dw][h] = math.ceil(en / UTL)
             occ[dw][h] = ca / en
+            nda[dw][h] = nivel_atencion(en, ca, AHT, PACIENCIA)
 
     H = 24
     turnos = {ini: [(ini + k) % H for k in range(LARGO)] for ini in range(H)}
@@ -91,7 +111,9 @@ def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
         ss = cp_model.CpSolver(); ss.Solve(mm)
         return sum(ss.Value(v) for v in xx.values())
     cw = max(crew(peak[5]), crew(peak[6]))
-    return {"peak": peak, "occ": occ, "xe": xe_s, "xc": xc_s, "te": te, "tc": tc,
+    vals = [nda[dw][h] for dw in range(7) for h in range(24) if peak[dw][h] > 0]
+    return {"peak": peak, "occ": occ, "nda": nda, "nda_min": min(vals) if vals else 1.0,
+            "xe": xe_s, "xc": xc_s, "te": te, "tc": tc,
             "crew": cw, "rot": cw * 4 // 2, "total": int(largo["volumen"].sum())}
 
 
@@ -160,14 +182,14 @@ def largo_desde_historico(file_bytes, mes, scope, K, semanas):
 
 
 @st.cache_data(show_spinner="Dimensionando y optimizando…")
-def resolver_crosstab(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
-    return dimension_roster(largo_desde_crosstab(file_bytes), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
+def resolver_crosstab(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA):
+    return dimension_roster(largo_desde_crosstab(file_bytes), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
 
 
 @st.cache_data(show_spinner="Pronosticando, dimensionando y optimizando…")
-def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
+def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA):
     return dimension_roster(largo_desde_historico(file_bytes, mes, scope, K, semanas),
-                            AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
+                            AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
 
 
 def turnos_dict(largo):
@@ -294,13 +316,13 @@ if modo == "Generar desde histórico":
     semanas = int(c4.number_input("Ventana perfil (sem.)", 2, 12, 6, 1))
     if up is not None:
         try:
-            S = resolver_historico(up.getvalue(), mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
+            S = resolver_historico(up.getvalue(), mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
         except Exception as e:
             st.error(f"No pude procesar el histórico: {e}")
 else:
     up = st.file_uploader("Sube tu pronóstico (días en columnas, intervalos en filas)", type=["xlsx", "xls"])
     if up is not None:
-        S = resolver_crosstab(up.getvalue(), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
+        S = resolver_crosstab(up.getvalue(), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
 
 if S is None:
     st.info("Sube el archivo para continuar.")
@@ -316,6 +338,8 @@ c3.metric("TOTAL presentes", S["te"] + S["tc"])
 c4.metric("En nómina (+absentismo)", math.ceil((S["te"] + S["tc"]) / (1 - ABS)))
 st.caption(f"Volumen del mes: {S['total']:,} llamadas · Rotación findes Colombia: cuadrilla {S['crew']}/finde, "
            f"{S['rot']} en rotación (2 grupos de {S['crew']}, máx. 2 findes/mes).")
+st.caption(f"NDA previsto (nivel de atención): mínimo {S['nda_min']:.1%} · objetivo {NDA_OBJ:.0%}. "
+           f"El tope de OCC ya garantiza un NDA alto; solo aprieta en horas de muy bajo volumen.")
 
 st.subheader("3) Programado vs Requerido y Ocupación")
 dsel = st.selectbox("Día", list(range(7)), format_func=lambda i: NOM[i])
@@ -337,6 +361,17 @@ ax2.set_xlabel("Hora"); ax2.set_ylabel("Ocupación %"); ax2.set_xticks(range(0, 
 ax2.set_ylim(0, 100); ax2.legend()
 st.pyplot(fig2)
 st.caption("Rojo = horas de baja ocupación (poca demanda). La línea marca tu objetivo de OCC.")
+
+st.markdown("**Nivel de atención (NDA) por hora**")
+ndav = [S["nda"][dsel][h] * 100 for h in range(24)]
+cols3 = ["#E76F51" if (S["nda"][dsel][h] < NDA_OBJ and S["peak"][dsel][h] > 0) else "#2A9D8F" for h in range(24)]
+fig3, ax3 = plt.subplots(figsize=(10, 3))
+ax3.bar(range(24), ndav, color=cols3)
+ax3.axhline(NDA_OBJ * 100, color="#264653", linestyle="--", linewidth=1, label=f"Objetivo {NDA_OBJ:.0%}")
+ax3.set_xlabel("Hora"); ax3.set_ylabel("NDA %"); ax3.set_xticks(range(0, 24, 2))
+ax3.set_ylim(0, 100); ax3.legend()
+st.pyplot(fig3)
+st.caption("Nivel de atención previsto (Erlang con abandono). Rojo = por debajo del objetivo.")
 
 st.subheader("4) Plan de turnos")
 filas = []
