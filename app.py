@@ -2,15 +2,18 @@ import io, math
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import holidays
 from ortools.sat.python import cp_model
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.chart import BarChart, LineChart, Reference
 
-st.set_page_config(page_title="WFM · Dimensionado y Roster", layout="wide")
-st.title("📞 WFM — Dimensionamiento y Roster")
+st.set_page_config(page_title="WFM · Pronóstico y Roster", layout="wide")
+st.title("📞 WFM — Pronóstico, Dimensionamiento y Roster")
 
 NOM = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+LIBRES = {p: {p, (p + 1) % 7} for p in range(7)}
+
 
 def erlang_b(a, c):
     b = 1.0
@@ -18,13 +21,17 @@ def erlang_b(a, c):
         b = (c * b) / (k + c * b)
     return b
 
+
 def erlang_c(a, c):
     b = erlang_b(a, c); r = c / a
     return b / (1 - r + r * b)
 
+
 def nivel_servicio(a, c, aht, asa):
     return 0.0 if a <= c else 1 - erlang_c(a, c) * math.exp(-(a - c) * asa / aht)
 
+
+# ---------------- Parámetros ----------------
 st.sidebar.header("Parámetros")
 AHT = st.sidebar.number_input("AHT (seg)", 60, 1200, 420, 10)
 SLA = st.sidebar.slider("SLA objetivo", 0.50, 0.99, 0.80, 0.01)
@@ -35,31 +42,14 @@ ABS = st.sidebar.slider("Absentismo", 0.00, 0.40, 0.15, 0.01)
 ESP_MAX = st.sidebar.number_input("Agentes España (máx, solo L–V)", 0, 200, 12, 1)
 LARGO = int(st.sidebar.number_input("Duración turno (h)", 6, 12, 9, 1))
 
-@st.cache_data(show_spinner="Dimensionando y optimizando turnos…")
-def resolver(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
-    raw = pd.read_excel(io.BytesIO(file_bytes))
-    fechas = raw.iloc[0]
-    first = raw.columns[0]
-    d = raw.drop(index=0)
-    d = d[d[first].astype(str).str.lower() != "total"].rename(columns={first: "intervalo"})
-    L = d.melt(id_vars="intervalo", var_name="col", value_name="vol")
-    L["fecha"] = L["col"].map(fechas)
-    L = L[L["fecha"].apply(lambda x: isinstance(x, pd.Timestamp))]
-    L["vol"] = pd.to_numeric(L["vol"], errors="coerce")
-    L = L.dropna(subset=["vol"])
 
-    def hh(x):
-        try:
-            return int(x)
-        except Exception:
-            return int(str(x).split(":")[0])
-    L["intervalo"] = L["intervalo"].apply(hh)
-    L = L[(L["intervalo"] >= 0) & (L["intervalo"] <= 23)]
-    L["dow"] = L["fecha"].dt.dayofweek
-
+# ---------------- Núcleo: dimensionar + roster ----------------
+def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
+    largo = largo.copy()
+    largo["dow"] = pd.to_datetime(largo["fecha"]).dt.dayofweek
     volmax = {dw: [0.0] * 24 for dw in range(7)}
-    for (dw, h), g in L.groupby(["dow", "intervalo"]):
-        volmax[dw][h] = float(g["vol"].max())
+    for (dw, h), g in largo.groupby(["dow", "intervalo"]):
+        volmax[dw][int(h)] = float(g["volumen"].max())
     peak = {dw: [0] * 24 for dw in range(7)}
     occ = {dw: [0.0] * 24 for dw in range(7)}
     for dw in range(7):
@@ -70,29 +60,26 @@ def resolver(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
             a = int(ca) + 1
             while nivel_servicio(a, ca, AHT, ASA) < SLA:
                 a += 1
-            en_linea = max(a, math.ceil(ca / OCC))
-            peak[dw][h] = math.ceil(en_linea / UTL)
-            occ[dw][h] = ca / en_linea
+            en = max(a, math.ceil(ca / OCC))
+            peak[dw][h] = math.ceil(en / UTL)
+            occ[dw][h] = ca / en
 
     H = 24
     turnos = {ini: [(ini + k) % H for k in range(LARGO)] for ini in range(H)}
-    libres = {p: {p, (p + 1) % 7} for p in range(7)}
-
     m = cp_model.CpModel()
     xc = {(t, p): m.NewIntVar(0, 300, f"c{t}_{p}") for t in turnos for p in range(7)}
     xe = {t: m.NewIntVar(0, 300, f"e{t}") for t in turnos}
     for dw in range(7):
         for h in range(H):
-            col = sum(xc[(t, p)] for t in turnos for p in range(7) if dw not in libres[p] and h in turnos[t])
-            esp = sum(xe[t] for t in turnos if dw not in libres[5] and h in turnos[t])
+            col = sum(xc[(t, p)] for t in turnos for p in range(7) if dw not in LIBRES[p] and h in turnos[t])
+            esp = sum(xe[t] for t in turnos if dw not in LIBRES[5] and h in turnos[t])
             m.Add(col + esp >= peak[dw][h])
-    TE = sum(xe.values()); TC = sum(xc.values())
-    m.Add(TE <= int(ESP_MAX))
-    m.Minimize(TC * 100 - TE)
-    sol = cp_model.CpSolver(); sol.Solve(m)
+    m.Add(sum(xe.values()) <= int(ESP_MAX))
+    m.Minimize(sum(xc.values()) * 100 - sum(xe.values()))
+    sv = cp_model.CpSolver(); sv.Solve(m)
 
-    xe_s = {str(t): sol.Value(xe[t]) for t in turnos if sol.Value(xe[t]) > 0}
-    xc_s = {f"{t}_{p}": sol.Value(xc[(t, p)]) for t in turnos for p in range(7) if sol.Value(xc[(t, p)]) > 0}
+    xe_s = {str(t): sv.Value(xe[t]) for t in turnos if sv.Value(xe[t]) > 0}
+    xc_s = {f"{t}_{p}": sv.Value(xc[(t, p)]) for t in turnos for p in range(7) if sv.Value(xc[(t, p)]) > 0}
     te = sum(xe_s.values()); tc = sum(xc_s.values())
 
     def crew(req):
@@ -104,12 +91,85 @@ def resolver(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
         ss = cp_model.CpSolver(); ss.Solve(mm)
         return sum(ss.Value(v) for v in xx.values())
     cw = max(crew(peak[5]), crew(peak[6]))
-    return {"peak": peak, "occ": occ, "xe": xe_s, "xc": xc_s, "te": te, "tc": tc, "crew": cw, "rot": cw * 4 // 2}
+    return {"peak": peak, "occ": occ, "xe": xe_s, "xc": xc_s, "te": te, "tc": tc,
+            "crew": cw, "rot": cw * 4 // 2, "total": int(largo["volumen"].sum())}
+
+
+# ---------------- Producir 'largo' (dos orígenes) ----------------
+def largo_desde_crosstab(file_bytes):
+    raw = pd.read_excel(io.BytesIO(file_bytes))
+    fechas = raw.iloc[0]; first = raw.columns[0]
+    d = raw.drop(index=0)
+    d = d[d[first].astype(str).str.lower() != "total"].rename(columns={first: "intervalo"})
+    L = d.melt(id_vars="intervalo", var_name="col", value_name="volumen")
+    L["fecha"] = L["col"].map(fechas)
+    L = L[L["fecha"].apply(lambda x: isinstance(x, pd.Timestamp))]
+    L["volumen"] = pd.to_numeric(L["volumen"], errors="coerce")
+    L = L.dropna(subset=["volumen"])
+
+    def hh(x):
+        try:
+            return int(x)
+        except Exception:
+            return int(str(x).split(":")[0])
+    L["intervalo"] = L["intervalo"].apply(hh)
+    L = L[(L["intervalo"] >= 0) & (L["intervalo"] <= 23)]
+    return L[["fecha", "intervalo", "volumen"]]
+
+
+def largo_desde_historico(file_bytes, mes, scope, K, semanas):
+    H = pd.read_excel(io.BytesIO(file_bytes), sheet_name="HISTORICO", header=2)
+    H["Fecha"] = pd.to_datetime(H["Fecha"], errors="coerce")
+    H["Entrantes"] = pd.to_numeric(H["Entrantes"], errors="coerce").fillna(0)
+    H = H.dropna(subset=["Fecha"])
+    hh = H.groupby([H["Fecha"].dt.normalize(), "Hora"])["Entrantes"].sum().reset_index()
+    hh.columns = ["fecha", "hora", "vol"]
+    dia = hh.groupby("fecha")["vol"].sum()
+
+    if scope == "Cataluña (Barcelona)":
+        ES = holidays.Spain(years=range(2024, 2028), subdiv="CT")
+    else:
+        ES = holidays.Spain(years=range(2024, 2028))
+
+    def fest(t):
+        return t.date() in ES
+
+    def total_diario(t):
+        wd = 6 if fest(t) else t.dayofweek
+        s = dia[(dia.index < t) & (dia.index.dayofweek == wd)]
+        if wd != 6:
+            s = s[[not fest(d) for d in s.index]]
+        return s.tail(K).mean()
+
+    ini = pd.Timestamp(mes + "-01")
+    win = hh[(hh["fecha"] < ini) & (hh["fecha"] >= ini - pd.Timedelta(weeks=semanas))]
+    win = win[[not fest(d) for d in win["fecha"]]]
+    perfil = win.groupby([win["fecha"].dt.dayofweek, "hora"])["vol"].mean().unstack(fill_value=0)
+    perfil = perfil.div(perfil.sum(axis=1), axis=0)
+
+    filas = []
+    for t in pd.date_range(ini, ini + pd.offsets.MonthEnd(0)):
+        dt = total_diario(t)
+        wd = 6 if fest(t) else t.dayofweek
+        for hr in range(24):
+            filas.append({"fecha": t, "intervalo": hr, "volumen": round(dt * perfil.loc[wd].get(hr, 0))})
+    return pd.DataFrame(filas)
+
+
+@st.cache_data(show_spinner="Dimensionando y optimizando…")
+def resolver_crosstab(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
+    return dimension_roster(largo_desde_crosstab(file_bytes), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
+
+
+@st.cache_data(show_spinner="Pronosticando, dimensionando y optimizando…")
+def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO):
+    return dimension_roster(largo_desde_historico(file_bytes, mes, scope, K, semanas),
+                            AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
+
 
 def turnos_dict(largo):
     return {ini: [(ini + k) % 24 for k in range(largo)] for ini in range(24)}
 
-LIBRES = {p: {p, (p + 1) % 7} for p in range(7)}
 
 def cubierto(S, turnos, dw, h):
     cob = sum(v for k, v in S["xc"].items()
@@ -117,6 +177,7 @@ def cubierto(S, turnos, dw, h):
     cob += sum(v for k, v in S["xe"].items()
                if dw not in LIBRES[5] and h in turnos[int(k)])
     return cob
+
 
 def build_excel(S, turnos, params):
     AHT, SLA, ASA, OCC, UTL, ABS = params
@@ -153,7 +214,8 @@ def build_excel(S, turnos, params):
         trab += sum(v for k, v in S["xe"].items() if dw not in LIBRES[5])
         for j, v in enumerate([NOM[dw], trab, max(peak[dw])], 1):
             x = ws.cell(r, j, v); x.font = REG; x.border = BORD
-            if j > 1: x.alignment = CEN
+            if j > 1:
+                x.alignment = CEN
         r += 1
     ws.column_dimensions["A"].width = 30; ws.column_dimensions["B"].width = 14; ws.column_dimensions["C"].width = 16
 
@@ -163,13 +225,16 @@ def build_excel(S, turnos, params):
         ws.column_dimensions[col].width = w
     r = 2
     L = len(turnos[0])
+
     def add(r, pais, t, cant, off):
         o = sorted(off)
         vals = [pais, f"{t:02d}:00", f"{(t + L) % 24:02d}:00", cant, f"{NOM[o[0]]}, {NOM[o[1]]}"]
         for j, v in enumerate(vals, 1):
             x = ws.cell(r, j, v); x.font = REG; x.border = BORD
-            if j in (2, 3, 4): x.alignment = CEN
-            if pais == "España": x.fill = PatternFill("solid", start_color="FCE4D6")
+            if j in (2, 3, 4):
+                x.alignment = CEN
+            if pais == "España":
+                x.fill = PatternFill("solid", start_color="FCE4D6")
         return r + 1
     for k in sorted(S["xe"], key=int):
         r = add(r, "España", int(k), S["xe"][k], {5, 6})
@@ -180,7 +245,8 @@ def build_excel(S, turnos, params):
     wsg = wb.create_sheet("Grafico")
     wsg["A1"] = "Programados vs Requerido — por día"; wsg["A1"].font = TITLE
     hdr = ["Hora"]
-    for dw in range(7): hdr += [f"{NOM[dw]} Req", f"{NOM[dw]} Cub"]
+    for dw in range(7):
+        hdr += [f"{NOM[dw]} Req", f"{NOM[dw]} Cub"]
     for j, c in enumerate(hdr, 1):
         x = wsg.cell(3, j, c); x.fill = HEAD; x.font = HF; x.alignment = CEN
     for h in range(24):
@@ -207,13 +273,34 @@ def build_excel(S, turnos, params):
 
     bio = io.BytesIO(); wb.save(bio); return bio.getvalue()
 
-st.subheader("1) Sube tu pronóstico mensual")
-up = st.file_uploader("Excel con los días en columnas y los intervalos (0–23) en filas", type=["xlsx", "xls"])
-if up is None:
-    st.info("Sube el archivo de pronóstico para continuar.")
+
+# ================== UI ==================
+st.subheader("1) Origen de la demanda")
+modo = st.radio("¿Cómo obtenemos el pronóstico?",
+                ["Generar desde histórico", "Subir pronóstico ya hecho"])
+
+S = None
+if modo == "Generar desde histórico":
+    up = st.file_uploader("Sube tu Excel con la hoja HISTORICO", type=["xlsm", "xlsx"])
+    c1, c2, c3, c4 = st.columns(4)
+    mes = c1.text_input("Mes (AAAA-MM)", "2026-06")
+    scope = c2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
+    K = int(c3.number_input("Semanas promedio", 2, 12, 4, 1))
+    semanas = int(c4.number_input("Ventana perfil (sem.)", 2, 12, 6, 1))
+    if up is not None:
+        try:
+            S = resolver_historico(up.getvalue(), mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
+        except Exception as e:
+            st.error(f"No pude procesar el histórico: {e}")
+else:
+    up = st.file_uploader("Sube tu pronóstico (días en columnas, intervalos en filas)", type=["xlsx", "xls"])
+    if up is not None:
+        S = resolver_crosstab(up.getvalue(), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
+
+if S is None:
+    st.info("Sube el archivo para continuar.")
     st.stop()
 
-S = resolver(up.getvalue(), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO)
 turnos = turnos_dict(LARGO)
 
 st.subheader("2) Plantilla requerida")
@@ -222,9 +309,10 @@ c1.metric("España (L–V)", S["te"])
 c2.metric("Colombia", S["tc"])
 c3.metric("TOTAL presentes", S["te"] + S["tc"])
 c4.metric("En nómina (+absentismo)", math.ceil((S["te"] + S["tc"]) / (1 - ABS)))
-st.caption(f"Rotación de findes (Colombia): cuadrilla {S['crew']}/finde · {S['rot']} en rotación (2 grupos de {S['crew']}, máx. 2 findes/mes).")
+st.caption(f"Volumen del mes: {S['total']:,} llamadas · Rotación findes Colombia: cuadrilla {S['crew']}/finde, "
+           f"{S['rot']} en rotación (2 grupos de {S['crew']}, máx. 2 findes/mes).")
 
-st.subheader("3) Programados vs Requerido")
+st.subheader("3) Programado vs Requerido y Ocupación")
 dsel = st.selectbox("Día", list(range(7)), format_func=lambda i: NOM[i])
 req = [S["peak"][dsel][h] for h in range(24)]
 cob = [cubierto(S, turnos, dsel, h) for h in range(24)]
@@ -243,7 +331,7 @@ ax2.axhline(OCC * 100, color="#264653", linestyle="--", linewidth=1, label=f"Obj
 ax2.set_xlabel("Hora"); ax2.set_ylabel("Ocupación %"); ax2.set_xticks(range(0, 24, 2))
 ax2.set_ylim(0, 100); ax2.legend()
 st.pyplot(fig2)
-st.caption("Rojo = horas de baja ocupación (poca demanda, agentes casi ociosos). La línea marca tu objetivo de OCC.")
+st.caption("Rojo = horas de baja ocupación (poca demanda). La línea marca tu objetivo de OCC.")
 
 st.subheader("4) Plan de turnos")
 filas = []
@@ -256,7 +344,7 @@ st.dataframe(pd.DataFrame(filas, columns=["País", "Inicio", "Fin", "Cantidad", 
              use_container_width=True)
 
 st.subheader("5) Comparar con tu plantilla actual (opcional)")
-ag = st.file_uploader("Sube tu Excel de agentes (con columnas MODO, CENTRO, ESTADO…)",
+ag = st.file_uploader("Sube tu Excel de agentes (columnas MODO, CENTRO, ESTADO…)",
                       type=["xlsx", "xls"], key="agentes")
 if ag is not None:
     A = pd.read_excel(ag)
@@ -292,7 +380,7 @@ if ag is not None:
         st.success(f"Tienes {g} agentes de margen sobre lo necesario en nómina.")
     else:
         st.warning(f"Te faltan {-g} agentes respecto a lo necesario en nómina.")
-    st.caption("Centros: SEVILLA y BARCELONA → España; el resto → Colombia. Ajusta si tienes otros centros.")
+    st.caption("Centros: SEVILLA y BARCELONA → España; el resto → Colombia.")
 
 st.subheader("6) Descargar")
 st.download_button("⬇️ Roster en Excel (con gráficos)",
