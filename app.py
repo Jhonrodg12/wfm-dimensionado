@@ -46,8 +46,30 @@ def nivel_atencion(ag, carga, aht, pac, NMAX=250):
     return 1 - aband / lam
 
 
+def agregar_crudo(file_bytes):
+    # Agrega un Excel CRUDO (estructura del histórico) al formato único.
+    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name="HISTORICO")
+    raw.columns = [str(c).strip() for c in raw.columns]
+    cols = {"Fecha": "fecha", "Hora": "hora", "Cola Corta": "cola",
+            "Entrantes": "entrantes", "Atendidas": "atendidas", "Abandonadas": "abandonadas"}
+    falta = [c for c in cols if c not in raw.columns]
+    if falta:
+        raise ValueError("Faltan columnas en el Excel: " + ", ".join(falta))
+    d = raw[list(cols)].rename(columns=cols)
+    d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce").dt.normalize()
+    d["hora"] = pd.to_numeric(d["hora"], errors="coerce")
+    for c in ["entrantes", "atendidas", "abandonadas"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    d = d.dropna(subset=["fecha", "hora"])
+    d["hora"] = d["hora"].astype(int)
+    d = d[(d["hora"] >= 0) & (d["hora"] <= 23)]
+    agg = d.groupby(["fecha", "hora", "cola"])[["entrantes", "atendidas", "abandonadas"]].sum().reset_index()
+    return agg[agg["entrantes"] > 0]
+
+
 # ---------------- Selector de vista ----------------
-vista = st.sidebar.radio("Vista", ["Planificación (pronóstico y roster)", "Dashboard histórico", "Proyección anual"])
+vista = st.sidebar.radio("Vista", ["Planificación (pronóstico y roster)", "Dashboard histórico",
+                                   "Proyección anual", "Actualizar histórico"])
 
 # Histórico compartido: se sube UNA vez y persiste al cambiar de vista
 _hf = st.sidebar.file_uploader("Histórico único (historico.csv)", type=["csv"], key="hist")
@@ -134,6 +156,39 @@ if vista == "Dashboard histórico":
         ax3.legend(loc="upper left"); ax3b.legend(loc="upper right")
         st.pyplot(fig3)
         st.caption("Barras = entrantes por hora · línea = % atención por hora.")
+    st.stop()
+
+
+if vista == "Actualizar histórico":
+    st.header("➕ Actualizar histórico")
+    st.write("Sube el histórico maestro en la barra lateral y aquí un Excel con **solo los días nuevos** "
+             "(misma estructura que tu histórico). Se fusionan y descargas el maestro actualizado.")
+    if HIST is None:
+        st.info("Primero sube el histórico maestro (historico.csv) en la barra lateral.")
+        st.stop()
+    maestro = pd.read_csv(io.BytesIO(HIST))
+    maestro.columns = [c.strip().lower() for c in maestro.columns]
+    maestro["fecha"] = pd.to_datetime(maestro["fecha"], errors="coerce").dt.normalize()
+    st.caption(f"Maestro actual: {len(maestro):,} filas · {maestro['fecha'].min().date()} → {maestro['fecha'].max().date()}")
+    nuevos = st.file_uploader("Días nuevos (Excel crudo, hoja HISTORICO)", type=["xlsx", "xls"], key="nuevos")
+    if nuevos is None:
+        st.stop()
+    try:
+        nuevo_agg = agregar_crudo(nuevos.getvalue())
+    except Exception as e:
+        st.error(f"No pude leer el Excel: {e}")
+        st.stop()
+    st.caption(f"Días nuevos: {nuevo_agg['fecha'].min().date()} → {nuevo_agg['fecha'].max().date()} ({nuevo_agg['fecha'].nunique()} días)")
+    comb = pd.concat([maestro, nuevo_agg], ignore_index=True)
+    comb["fecha"] = pd.to_datetime(comb["fecha"]).dt.normalize()
+    comb = comb.drop_duplicates(["fecha", "hora", "cola"], keep="last").sort_values(["fecha", "hora", "cola"])
+    st.success(f"Maestro actualizado: {len(comb):,} filas · hasta {comb['fecha'].max().date()} "
+               f"(+{len(comb) - len(maestro):,} filas)")
+    csv = comb.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Descargar historico.csv actualizado", csv, "historico.csv", "text/csv")
+    st.session_state["hist_bytes"] = csv
+    st.caption("Ya quedó cargado en la sesión: las otras vistas usan el maestro actualizado. "
+               "Igual descárgalo para reemplazar tu copia local.")
     st.stop()
 
 
