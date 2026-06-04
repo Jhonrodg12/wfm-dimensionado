@@ -49,14 +49,18 @@ def nivel_atencion(ag, carga, aht, pac, NMAX=250):
 # ---------------- Selector de vista ----------------
 vista = st.sidebar.radio("Vista", ["Planificación (pronóstico y roster)", "Dashboard histórico", "Proyección anual"])
 
+# Histórico compartido: se sube UNA vez y persiste al cambiar de vista
+_hf = st.sidebar.file_uploader("Histórico único (historico.csv)", type=["csv"], key="hist")
+if _hf is not None:
+    st.session_state["hist_bytes"] = _hf.getvalue()
+HIST = st.session_state.get("hist_bytes")
+
 if vista == "Dashboard histórico":
     st.header("📊 Dashboard histórico por cola")
-    upd = st.file_uploader("Sube tu archivo único (CSV: fecha, hora, cola, entrantes, atendidas, abandonadas)",
-                           type=["csv"], key="dash")
-    if upd is None:
-        st.info("Sube el archivo agregado por cola para ver el dashboard.")
+    if HIST is None:
+        st.info("Sube el histórico único en la barra lateral para ver el dashboard.")
         st.stop()
-    d = pd.read_csv(upd)
+    d = pd.read_csv(io.BytesIO(HIST))
     d.columns = [c.strip().lower() for c in d.columns]
     d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce")
     d = d.dropna(subset=["fecha"])
@@ -135,11 +139,10 @@ if vista == "Dashboard histórico":
 
 if vista == "Proyección anual":
     st.header("📅 Proyección anual (escenarios)")
-    upa = st.file_uploader("Sube tu archivo único (CSV: fecha, hora, cola, entrantes, …)", type=["csv"], key="anual")
-    if upa is None:
-        st.info("Sube el archivo único para ver la proyección.")
+    if HIST is None:
+        st.info("Sube el histórico único en la barra lateral para ver la proyección.")
         st.stop()
-    d = pd.read_csv(upa)
+    d = pd.read_csv(io.BytesIO(HIST))
     d.columns = [c.strip().lower() for c in d.columns]
     d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce")
     vc = "entrantes" if "entrantes" in d.columns else "vol"
@@ -169,13 +172,14 @@ if vista == "Proyección anual":
     año = c1.selectbox("Año a proyectar", años, index=len(años) - 1)
     scope_a = c2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
     K = int(c3.number_input("Semanas de historia (K)", 2, 12, 4, 1))
-    c4, c5 = st.columns(2)
-    recencia = c4.slider("Peso a lo reciente", 0.0, 0.9, 0.0, 0.1,
+    recencia = st.slider("Peso a lo reciente", 0.0, 0.9, 0.0, 0.1,
                          help="0 = todas las semanas pesan igual · más alto = las semanas recientes mandan")
-    uplift = c5.slider("Ajuste global de tráfico (%)", -30, 30, 0, 1) / 100.0
-    with st.expander("Estacionalidad por mes (multiplicador, 1.0 = sin cambio)"):
+    st.markdown("**Ajuste por mes (%)** — sube o baja cada mes proyectado de forma independiente:")
+    with st.expander("Editar ajuste por mes"):
         mc = st.columns(6)
-        factor = [mc[i % 6].number_input(meses_nom[i], 0.1, 3.0, 1.0, 0.05, key=f"fm{i}") for i in range(12)]
+        ajuste = [mc[i % 6].number_input(meses_nom[i], -50, 100, 0, 5, key=f"am{i}") / 100.0 for i in range(12)]
+    # Se guarda para que Planificación use el mismo ajuste del mes que dimensione
+    st.session_state["ajuste_mes"] = {m + 1: ajuste[m] for m in range(12)}
 
     if scope_a == "Cataluña (Barcelona)":
         ES = holidays.Spain(years=range(min(años) - 1, max(años) + 2), subdiv="CT")
@@ -205,10 +209,15 @@ if vista == "Proyección anual":
     axd.bar([NOM[i] for i in range(7)], pdow.values, color="#2A9D8F")
     axd.set_ylabel("Entrantes/día"); axd.set_title("Promedio por día de semana")
     g1.pyplot(figd)
-    sem = dia.resample("W").sum()
+    dia_año = dia[dia.index.year == año]
+    sem = dia_año.resample("W").sum()
+    import matplotlib.dates as mdates
     figs, axs = plt.subplots(figsize=(5, 3))
-    axs.plot(sem.index, sem.values, color="#1F6F66")
-    axs.set_ylabel("Entrantes/semana"); axs.set_title("Volumen por semana")
+    axs.plot(sem.index, sem.values, color="#1F6F66", marker="o", markersize=3)
+    axs.set_ylabel("Entrantes/semana"); axs.set_title(f"Volumen por semana {año}")
+    axs.grid(True, alpha=0.3)
+    axs.xaxis.set_major_locator(mdates.MonthLocator())
+    axs.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
     g2.pyplot(figs)
 
     # Proyección mensual (real intacto; multiplicador y % solo a lo proyectado)
@@ -225,7 +234,7 @@ if vista == "Proyección anual":
                 proj_part += proj_dia(t)
         n_real = sum(1 for t in dias_mes if t in dia.index)
         estado = "REAL" if n_real >= len(dias_mes) else ("EN CURSO" if n_real > 0 else "PROYECTADO")
-        total = real_part + proj_part * factor[mth - 1] * (1 + uplift)
+        total = real_part + proj_part * (1 + ajuste[mth - 1])
         filas.append({"Mes": meses_nom[mth - 1], "Estado": estado,
                       "Real a la fecha": int(round(real_part)), "Proyectado mes": int(round(total))})
     tab = pd.DataFrame(filas)
@@ -238,7 +247,7 @@ if vista == "Proyección anual":
     axp.bar(tab["Mes"], tab["Proyectado mes"], color=[cores[e] for e in tab["Estado"]])
     axp.set_ylabel("Llamadas"); axp.set_title(f"Volumen mensual {año} (real + proyectado)")
     st.pyplot(figp)
-    st.caption("Verde = real · Amarillo = en curso · Gris = proyectado. El multiplicador y el ajuste % se aplican solo a los días proyectados.")
+    st.caption("Verde = real · Amarillo = en curso · Gris = proyectado. El ajuste por mes se aplica solo a los días proyectados y se usa también en Planificación.")
     st.stop()
 
 
@@ -336,7 +345,7 @@ def largo_desde_crosstab(file_bytes):
     return L[["fecha", "intervalo", "volumen"]]
 
 
-def largo_desde_historico(file_bytes, mes, scope, K, semanas):
+def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0):
     # Archivo ÚNICO (CSV: fecha, hora, cola, entrantes, atendidas, abandonadas)
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.strip().lower() for c in df.columns]
@@ -376,7 +385,7 @@ def largo_desde_historico(file_bytes, mes, scope, K, semanas):
         dt = total_diario(t)
         wd = 6 if fest(t) else t.dayofweek
         for hr in range(24):
-            filas.append({"fecha": t, "intervalo": hr, "volumen": round(dt * perfil.loc[wd].get(hr, 0))})
+            filas.append({"fecha": t, "intervalo": hr, "volumen": round(dt * perfil.loc[wd].get(hr, 0) * (1 + ajuste))})
     return pd.DataFrame(filas)
 
 
@@ -386,8 +395,8 @@ def resolver_crosstab(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_O
 
 
 @st.cache_data(show_spinner="Pronosticando, dimensionando y optimizando…")
-def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA):
-    return dimension_roster(largo_desde_historico(file_bytes, mes, scope, K, semanas),
+def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ajuste=0.0):
+    return dimension_roster(largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste),
                             AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
 
 
@@ -505,17 +514,26 @@ modo = st.radio("¿Cómo obtenemos el pronóstico?",
 
 S = None
 if modo == "Generar desde histórico":
-    up = st.file_uploader("Sube tu archivo único (CSV: fecha, hora, cola, entrantes, atendidas, abandonadas)", type=["csv"])
-    st.caption("Es el mismo archivo que alimenta el Dashboard y la Proyección anual. Se genera una vez en Colab "
-               "a partir del histórico crudo (el de 95 MB es demasiado pesado para la web).")
+    st.caption("Usa el mismo archivo del Dashboard y la Proyección anual (se sube una vez en la barra lateral). "
+               "Se genera en Colab a partir del histórico crudo.")
     c1, c2, c3, c4 = st.columns(4)
     mes = c1.text_input("Mes (AAAA-MM)", "2026-06")
     scope = c2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
     K = int(c3.number_input("Semanas promedio", 2, 12, 4, 1))
     semanas = int(c4.number_input("Ventana perfil (sem.)", 2, 12, 6, 1))
-    if up is not None:
+    # Ajuste del mes definido en la Proyección anual (si existe)
+    try:
+        mnum = int(mes.split("-")[1])
+    except Exception:
+        mnum = 0
+    ajuste_mes = st.session_state.get("ajuste_mes", {}).get(mnum, 0.0)
+    if ajuste_mes:
+        st.caption(f"Aplicando ajuste de {int(ajuste_mes * 100):+d}% definido para ese mes en la Proyección anual.")
+    if HIST is None:
+        st.info("Sube el histórico único en la barra lateral.")
+    else:
         try:
-            S = resolver_historico(up.getvalue(), mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
+            S = resolver_historico(HIST, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ajuste_mes)
         except Exception as e:
             st.error(f"No pude procesar el histórico: {e}")
 else:
