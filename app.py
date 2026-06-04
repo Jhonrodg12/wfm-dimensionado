@@ -203,20 +203,21 @@ if vista == "Proyección anual":
     vc = "entrantes" if "entrantes" in d.columns else "vol"
     d[vc] = pd.to_numeric(d[vc], errors="coerce").fillna(0)
     d = d.dropna(subset=["fecha"])
+    d["fecha"] = d["fecha"].dt.normalize()
     meses_nom = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+    if "cola" not in d.columns:
+        d["cola"] = "TOTAL"
 
     # Filtro por colas (con su % de entrantes)
-    if "cola" in d.columns:
-        share = d.groupby("cola")[vc].sum().sort_values(ascending=False)
-        spct = (share / share.sum() * 100).round(1)
-        ops = [f"{c}  ({spct[c]}%)" for c in share.index]
-        sel = st.multiselect("Colas a incluir (con su % de entrantes)", ops, default=ops)
-        colas_sel = [o.rsplit("  (", 1)[0] for o in sel]
-        if colas_sel:
-            d = d[d["cola"].isin(colas_sel)]
-            st.caption(f"Incluyes el {round(share[colas_sel].sum() / share.sum() * 100, 1)}% del tráfico total.")
+    share = d.groupby("cola")[vc].sum().sort_values(ascending=False)
+    spct = (share / share.sum() * 100).round(1)
+    ops = [f"{c}  ({spct[c]}%)" for c in share.index]
+    sel = st.multiselect("Colas a incluir (con su % de entrantes)", ops, default=ops)
+    colas_sel = [o.rsplit("  (", 1)[0] for o in sel] or list(share.index)
+    d = d[d["cola"].isin(colas_sel)]
+    st.caption(f"Incluyes el {round(share[colas_sel].sum() / share.sum() * 100, 1)}% del tráfico total.")
 
-    dia = d.groupby(d["fecha"].dt.normalize())[vc].sum()
+    dia = d.groupby("fecha")[vc].sum()
     if dia.empty:
         st.warning("No hay datos con esos filtros.")
         st.stop()
@@ -228,13 +229,18 @@ if vista == "Proyección anual":
     scope_a = c2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
     K = int(c3.number_input("Semanas de historia (K)", 2, 12, 4, 1))
     recencia = st.slider("Peso a lo reciente", 0.0, 0.9, 0.0, 0.1,
-                         help="0 = todas las semanas pesan igual · más alto = las semanas recientes mandan")
-    st.markdown("**Ajuste por mes (%)** — sube o baja cada mes proyectado de forma independiente:")
-    with st.expander("Editar ajuste por mes"):
+                         help="0 = todas las semanas pesan igual · más alto = las recientes mandan")
+    with st.expander("Ajuste por mes (%) — aplica a todas las colas ese mes"):
         mc = st.columns(6)
-        ajuste = [mc[i % 6].number_input(meses_nom[i], -50, 100, 0, 5, key=f"am{i}") / 100.0 for i in range(12)]
-    # Se guarda para que Planificación use el mismo ajuste del mes que dimensione
-    st.session_state["ajuste_mes"] = {m + 1: ajuste[m] for m in range(12)}
+        adj_mes = [mc[i % 6].number_input(meses_nom[i], -50, 100, 0, 5, key=f"am{i}") / 100.0 for i in range(12)]
+    with st.expander("Ajuste por cola (%) — aplica a esa cola todo el año"):
+        cc = st.columns(3)
+        adj_cola = {c: cc[i % 3].number_input(c, -50, 100, 0, 5, key=f"ac{i}") / 100.0
+                    for i, c in enumerate(colas_sel)}
+
+    # Peso de cada cola -> el ajuste por cola escala el total según su participación
+    sh = share[colas_sel] / share[colas_sel].sum()
+    cola_factor = float(sum(sh[c] * (1 + adj_cola.get(c, 0.0)) for c in colas_sel))
 
     if scope_a == "Cataluña (Barcelona)":
         ES = holidays.Spain(years=range(min(años) - 1, max(años) + 2), subdiv="CT")
@@ -271,38 +277,50 @@ if vista == "Proyección anual":
     axs.plot(sem.index, sem.values, color="#1F6F66", marker="o", markersize=3)
     axs.set_ylabel("Entrantes/semana"); axs.set_title(f"Volumen por semana {año}")
     axs.grid(True, alpha=0.3)
-    axs.xaxis.set_major_locator(mdates.MonthLocator())
-    axs.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    axs.xaxis.set_major_locator(mdates.MonthLocator()); axs.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
     g2.pyplot(figs)
 
-    # Proyección mensual (real intacto; multiplicador y % solo a lo proyectado)
+    # Proyección mensual: Base (sin ajustes) vs Escenario (con tus ajustes)
     filas = []
+    efectivo = {}
     for mth in range(1, 13):
-        ini = pd.Timestamp(year=año, month=mth, day=1)
-        fin = ini + pd.offsets.MonthEnd(0)
+        ini = pd.Timestamp(year=año, month=mth, day=1); fin = ini + pd.offsets.MonthEnd(0)
         dias_mes = pd.date_range(ini, fin)
-        real_part = proj_part = 0.0
+        real_part = pbase = 0.0
         for t in dias_mes:
             if t in dia.index:
                 real_part += float(dia.loc[t])
             else:
-                proj_part += proj_dia(t)
+                pbase += proj_dia(t)
         n_real = sum(1 for t in dias_mes if t in dia.index)
         estado = "REAL" if n_real >= len(dias_mes) else ("EN CURSO" if n_real > 0 else "PROYECTADO")
-        total = real_part + proj_part * (1 + ajuste[mth - 1])
-        filas.append({"Mes": meses_nom[mth - 1], "Estado": estado,
-                      "Real a la fecha": int(round(real_part)), "Proyectado mes": int(round(total))})
+        f_mes = cola_factor * (1 + adj_mes[mth - 1])          # factor del escenario para días proyectados
+        base_tot = real_part + pbase
+        scn_tot = real_part + pbase * f_mes
+        efectivo[mth] = f_mes - 1.0
+        delta = (scn_tot / base_tot - 1) * 100 if base_tot > 0 else 0.0
+        filas.append({"Mes": meses_nom[mth - 1], "Estado": estado, "Real": int(round(real_part)),
+                      "Base": int(round(base_tot)), "Escenario": int(round(scn_tot)), "Δ%": round(delta, 1)})
+    st.session_state["ajuste_mes"] = efectivo
     tab = pd.DataFrame(filas)
-    m1, m2 = st.columns(2)
-    m1.metric(f"Proyección total {año}", f"{int(tab['Proyectado mes'].sum()):,}")
-    m2.metric("Real acumulado", f"{int(tab['Real a la fecha'].sum()):,}")
+
+    st.subheader("Comparador: Base vs Escenario")
+    m1, m2, m3 = st.columns(3)
+    tb = int(tab["Base"].sum()); tsc = int(tab["Escenario"].sum())
+    m1.metric(f"Base {año}", f"{tb:,}")
+    m2.metric(f"Escenario {año}", f"{tsc:,}")
+    m3.metric("Diferencia", f"{tsc - tb:+,}", f"{(tsc / tb - 1) * 100:+.1f}%" if tb else "—")
     st.dataframe(tab, use_container_width=True)
-    cores = {"REAL": "#2A9D8F", "EN CURSO": "#E9C46A", "PROYECTADO": "#C9D6D3"}
+
+    x = np.arange(12); w = 0.38
     figp, axp = plt.subplots(figsize=(11, 4))
-    axp.bar(tab["Mes"], tab["Proyectado mes"], color=[cores[e] for e in tab["Estado"]])
-    axp.set_ylabel("Llamadas"); axp.set_title(f"Volumen mensual {año} (real + proyectado)")
+    axp.bar(x - w / 2, tab["Base"], w, label="Base", color="#C9D6D3")
+    axp.bar(x + w / 2, tab["Escenario"], w, label="Escenario", color="#2A9D8F")
+    axp.set_xticks(x); axp.set_xticklabels(tab["Mes"]); axp.set_ylabel("Llamadas"); axp.legend()
+    axp.set_title(f"Volumen mensual {año}: base vs escenario")
     st.pyplot(figp)
-    st.caption("Verde = real · Amarillo = en curso · Gris = proyectado. El ajuste por mes se aplica solo a los días proyectados y se usa también en Planificación.")
+    st.caption("Base = proyección sin ajustes · Escenario = con tus ajustes. El ajuste por cola escala según el "
+               "peso (%) de cada cola. El ajuste efectivo de cada mes se usa también en Planificación.")
     st.stop()
 
 
