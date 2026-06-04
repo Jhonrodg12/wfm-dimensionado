@@ -134,21 +134,49 @@ if vista == "Dashboard histórico":
 
 
 if vista == "Proyección anual":
-    st.header("📅 Proyección anual")
+    st.header("📅 Proyección anual (escenarios)")
     upa = st.file_uploader("Sube tu archivo único (CSV: fecha, hora, cola, entrantes, …)", type=["csv"], key="anual")
     if upa is None:
         st.info("Sube el archivo único para ver la proyección.")
         st.stop()
-    scope_a = st.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
     d = pd.read_csv(upa)
     d.columns = [c.strip().lower() for c in d.columns]
     d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce")
     vc = "entrantes" if "entrantes" in d.columns else "vol"
     d[vc] = pd.to_numeric(d[vc], errors="coerce").fillna(0)
     d = d.dropna(subset=["fecha"])
+    meses_nom = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+
+    # Filtro por colas (con su % de entrantes)
+    if "cola" in d.columns:
+        share = d.groupby("cola")[vc].sum().sort_values(ascending=False)
+        spct = (share / share.sum() * 100).round(1)
+        ops = [f"{c}  ({spct[c]}%)" for c in share.index]
+        sel = st.multiselect("Colas a incluir (con su % de entrantes)", ops, default=ops)
+        colas_sel = [o.rsplit("  (", 1)[0] for o in sel]
+        if colas_sel:
+            d = d[d["cola"].isin(colas_sel)]
+            st.caption(f"Incluyes el {round(share[colas_sel].sum() / share.sum() * 100, 1)}% del tráfico total.")
+
     dia = d.groupby(d["fecha"].dt.normalize())[vc].sum()
+    if dia.empty:
+        st.warning("No hay datos con esos filtros.")
+        st.stop()
     años = sorted({t.year for t in dia.index})
-    año = st.selectbox("Año a proyectar", años, index=len(años) - 1)
+
+    st.subheader("Parámetros de proyección")
+    c1, c2, c3 = st.columns(3)
+    año = c1.selectbox("Año a proyectar", años, index=len(años) - 1)
+    scope_a = c2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
+    K = int(c3.number_input("Semanas de historia (K)", 2, 12, 4, 1))
+    c4, c5 = st.columns(2)
+    recencia = c4.slider("Peso a lo reciente", 0.0, 0.9, 0.0, 0.1,
+                         help="0 = todas las semanas pesan igual · más alto = las semanas recientes mandan")
+    uplift = c5.slider("Ajuste global de tráfico (%)", -30, 30, 0, 1) / 100.0
+    with st.expander("Estacionalidad por mes (multiplicador, 1.0 = sin cambio)"):
+        mc = st.columns(6)
+        factor = [mc[i % 6].number_input(meses_nom[i], 0.1, 3.0, 1.0, 0.05, key=f"fm{i}") for i in range(12)]
+
     if scope_a == "Cataluña (Barcelona)":
         ES = holidays.Spain(years=range(min(años) - 1, max(años) + 2), subdiv="CT")
     else:
@@ -162,30 +190,55 @@ if vista == "Proyección anual":
         s = dia[(dia.index < t) & (dia.index.dayofweek == wd)]
         if wd != 6:
             s = s[[not fest(x) for x in s.index]]
-        return s.tail(4).mean() if len(s) else 0.0
+        s = s.tail(K)
+        if len(s) == 0:
+            return 0.0
+        v = s.values[::-1]
+        w = np.array([(1 - recencia) ** j for j in range(len(v))])
+        return float((v * w).sum() / w.sum())
 
+    # Promedios históricos
+    st.subheader("Promedios históricos (colas seleccionadas)")
+    g1, g2 = st.columns(2)
+    pdow = dia.groupby(dia.index.dayofweek).mean().reindex(range(7)).fillna(0)
+    figd, axd = plt.subplots(figsize=(5, 3))
+    axd.bar([NOM[i] for i in range(7)], pdow.values, color="#2A9D8F")
+    axd.set_ylabel("Entrantes/día"); axd.set_title("Promedio por día de semana")
+    g1.pyplot(figd)
+    sem = dia.resample("W").sum()
+    figs, axs = plt.subplots(figsize=(5, 3))
+    axs.plot(sem.index, sem.values, color="#1F6F66")
+    axs.set_ylabel("Entrantes/semana"); axs.set_title("Volumen por semana")
+    g2.pyplot(figs)
+
+    # Proyección mensual (real intacto; multiplicador y % solo a lo proyectado)
     filas = []
     for mth in range(1, 13):
         ini = pd.Timestamp(year=año, month=mth, day=1)
         fin = ini + pd.offsets.MonthEnd(0)
         dias_mes = pd.date_range(ini, fin)
-        real = dia[(dia.index >= ini) & (dia.index <= fin)]
-        n_real = real.index.nunique()
-        proy = sum(dia.get(t, proj_dia(t)) for t in dias_mes)
+        real_part = proj_part = 0.0
+        for t in dias_mes:
+            if t in dia.index:
+                real_part += float(dia.loc[t])
+            else:
+                proj_part += proj_dia(t)
+        n_real = sum(1 for t in dias_mes if t in dia.index)
         estado = "REAL" if n_real >= len(dias_mes) else ("EN CURSO" if n_real > 0 else "PROYECTADO")
-        filas.append({"Mes": ini.strftime("%b"), "Estado": estado,
-                      "Real a la fecha": int(real.sum()), "Proyectado mes": int(round(proy))})
+        total = real_part + proj_part * factor[mth - 1] * (1 + uplift)
+        filas.append({"Mes": meses_nom[mth - 1], "Estado": estado,
+                      "Real a la fecha": int(round(real_part)), "Proyectado mes": int(round(total))})
     tab = pd.DataFrame(filas)
-    c1, c2 = st.columns(2)
-    c1.metric(f"Proyección total {año}", f"{int(tab['Proyectado mes'].sum()):,}")
-    c2.metric("Real acumulado", f"{int(tab['Real a la fecha'].sum()):,}")
+    m1, m2 = st.columns(2)
+    m1.metric(f"Proyección total {año}", f"{int(tab['Proyectado mes'].sum()):,}")
+    m2.metric("Real acumulado", f"{int(tab['Real a la fecha'].sum()):,}")
     st.dataframe(tab, use_container_width=True)
     cores = {"REAL": "#2A9D8F", "EN CURSO": "#E9C46A", "PROYECTADO": "#C9D6D3"}
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.bar(tab["Mes"], tab["Proyectado mes"], color=[cores[e] for e in tab["Estado"]])
-    ax.set_ylabel("Llamadas"); ax.set_title(f"Volumen mensual {año} (real + proyectado)")
-    st.pyplot(fig)
-    st.caption("Verde = mes real · Amarillo = mes en curso · Gris = proyectado.")
+    figp, axp = plt.subplots(figsize=(11, 4))
+    axp.bar(tab["Mes"], tab["Proyectado mes"], color=[cores[e] for e in tab["Estado"]])
+    axp.set_ylabel("Llamadas"); axp.set_title(f"Volumen mensual {año} (real + proyectado)")
+    st.pyplot(figp)
+    st.caption("Verde = real · Amarillo = en curso · Gris = proyectado. El multiplicador y el ajuste % se aplican solo a los días proyectados.")
     st.stop()
 
 
