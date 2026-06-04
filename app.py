@@ -418,7 +418,7 @@ def largo_desde_crosstab(file_bytes):
     return L[["fecha", "intervalo", "volumen"]]
 
 
-def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0):
+def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0, mixto=False):
     # Archivo ÚNICO (CSV: fecha, hora, cola, entrantes, atendidas, abandonadas)
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.strip().lower() for c in df.columns]
@@ -431,6 +431,8 @@ def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0):
     hh = df.groupby(["fecha", "hora"])[volcol].sum().reset_index()
     hh.columns = ["fecha", "hora", "vol"]
     dia = hh.groupby("fecha")["vol"].sum()
+    real_piv = hh.pivot_table(index="fecha", columns="hora", values="vol", aggfunc="sum")
+    real_set = set(dia.index)
 
     if scope == "Cataluña (Barcelona)":
         ES = holidays.Spain(years=range(2023, 2028), subdiv="CT")
@@ -460,10 +462,16 @@ def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0):
 
     filas = []
     for t in pd.date_range(ini, ini + pd.offsets.MonthEnd(0)):
-        dt = total_diario(t)
         wd = 6 if fest(t) else t.dayofweek
-        for hr in range(24):
-            filas.append({"fecha": t, "intervalo": hr, "volumen": round(dt * perfil.loc[wd].get(hr, 0) * (1 + ajuste))})
+        if mixto and t in real_set:
+            row = real_piv.loc[t] if t in real_piv.index else None
+            for hr in range(24):
+                vv = row.get(hr) if row is not None else None
+                filas.append({"fecha": t, "intervalo": hr, "volumen": int(vv) if pd.notna(vv) else 0})
+        else:
+            dt = total_diario(t)
+            for hr in range(24):
+                filas.append({"fecha": t, "intervalo": hr, "volumen": round(dt * perfil.loc[wd].get(hr, 0) * (1 + ajuste))})
     return pd.DataFrame(filas)
 
 
@@ -473,8 +481,8 @@ def resolver_crosstab(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_O
 
 
 @st.cache_data(show_spinner="Pronosticando, dimensionando y optimizando…")
-def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ajuste=0.0):
-    return dimension_roster(largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste),
+def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ajuste=0.0, mixto=False):
+    return dimension_roster(largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste, mixto),
                             AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
 
 
@@ -596,24 +604,33 @@ if vista == "Plan de capacidad anual":
     año_cap = int(p1.number_input("Año", 2024, 2030, 2026, 1))
     scope_cap = p2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
     K_cap = int(p3.number_input("Semanas promedio", 2, 12, 4, 1))
-    st.caption("Usa los parámetros de la barra lateral (AHT, SLA, OCC, UTL, absentismo…) y los ajustes por mes "
-               "definidos en la Proyección anual. Puede tardar ~1 min la primera vez (dimensiona los 12 meses).")
+    base_calc = st.radio("Base de cálculo", ["Real + proyectado (recomendado)", "Solo pronóstico"], horizontal=True)
+    usar_mixto = base_calc.startswith("Real")
+    st.caption("Real + proyectado: los meses con datos completos se dimensionan con su volumen REAL y los futuros "
+               "con pronóstico. Usa los parámetros de la barra lateral y los ajustes por mes de la Proyección anual.")
+    dcheck = pd.read_csv(io.BytesIO(HIST))
+    dcheck.columns = [c.strip().lower() for c in dcheck.columns]
+    dcheck["fecha"] = pd.to_datetime(dcheck["fecha"], errors="coerce").dt.normalize()
+    dias_datos = set(dcheck.dropna(subset=["fecha"])["fecha"])
     ajuste_mes = st.session_state.get("ajuste_mes", {})
     filas = []
     prog = st.progress(0.0, text="Dimensionando meses…")
     for mth in range(1, 13):
         mes_str = f"{año_cap}-{mth:02d}"
         aj = ajuste_mes.get(mth, 0.0)
+        ini = pd.Timestamp(año_cap, mth, 1); dm = pd.date_range(ini, ini + pd.offsets.MonthEnd(0))
+        nr = sum(1 for t in dm if t in dias_datos)
+        estado = "Real" if nr >= len(dm) else ("En curso" if nr > 0 else "Proyectado")
         try:
             Sx = resolver_historico(HIST, mes_str, scope_cap, K_cap, 6,
-                                    AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, aj)
+                                    AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, aj, usar_mixto)
             presentes = Sx["te"] + Sx["tc"]
             nomina = math.ceil(presentes / (1 - ABS)) if ABS < 1 else presentes
-            filas.append({"Mes": MESES[mth - 1], "Volumen": Sx["total"], "España": Sx["te"],
+            filas.append({"Mes": MESES[mth - 1], "Estado": estado, "Volumen": Sx["total"], "España": Sx["te"],
                           "Colombia": Sx["tc"], "Presentes": presentes,
                           "En nómina": nomina, "Ajuste": f"{int(round(aj * 100)):+d}%"})
         except Exception as e:
-            filas.append({"Mes": MESES[mth - 1], "Volumen": 0, "España": 0, "Colombia": 0,
+            filas.append({"Mes": MESES[mth - 1], "Estado": estado, "Volumen": 0, "España": 0, "Colombia": 0,
                           "Presentes": 0, "En nómina": 0, "Ajuste": "—"})
         prog.progress(mth / 12, text=f"Dimensionando {MESES[mth - 1]}…")
     prog.empty()
