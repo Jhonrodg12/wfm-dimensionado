@@ -171,35 +171,45 @@ if vista == "Dashboard histórico":
 
 
 if vista == "Actualizar histórico":
-    st.header("➕ Actualizar histórico")
-    st.write("Sube el histórico maestro en la barra lateral y aquí un Excel con **solo los días nuevos** "
-             "(misma estructura que tu histórico). Se fusionan y descargas el maestro actualizado.")
-    if HIST is None:
-        st.info("Primero sube el histórico maestro (historico.csv) en la barra lateral.")
-        st.stop()
-    maestro = pd.read_csv(io.BytesIO(HIST))
-    maestro.columns = [c.strip().lower() for c in maestro.columns]
-    maestro["fecha"] = pd.to_datetime(maestro["fecha"], errors="coerce").dt.normalize()
-    st.caption(f"Maestro actual: {len(maestro):,} filas · {maestro['fecha'].min().date()} → {maestro['fecha'].max().date()}")
-    nuevos = st.file_uploader("Días nuevos (Excel crudo, hoja HISTORICO)", type=["xlsx", "xls"], key="nuevos")
+    st.header("➕ Preparar / actualizar histórico (sin Colab)")
+    st.write("Sube tu **Excel crudo** (hoja HISTORICO) y la app lo convierte al **formato único**. "
+             "Sirve para **crear desde cero** o para **agregar días nuevos** a lo que ya tengas.")
+    st.caption("Formato único de salida: campaña, fecha, hora, cola, entrantes, atendidas, abandonadas.")
+    camp_in = st.text_input("Nombre de la campaña para estos datos", "Endesa")
+    nuevos = st.file_uploader("Excel crudo (hoja HISTORICO)", type=["xlsx", "xls"], key="nuevos")
     if nuevos is None:
+        st.info("Sube el Excel crudo para procesarlo. Si pesa más de ~40–50 MB, mejor usa Colab (la web se queda corta).")
         st.stop()
     try:
         nuevo_agg = agregar_crudo(nuevos.getvalue())
     except Exception as e:
         st.error(f"No pude leer el Excel: {e}")
         st.stop()
-    st.caption(f"Días nuevos: {nuevo_agg['fecha'].min().date()} → {nuevo_agg['fecha'].max().date()} ({nuevo_agg['fecha'].nunique()} días)")
-    comb = pd.concat([maestro, nuevo_agg], ignore_index=True)
+    nuevo_agg.insert(0, "campaña", camp_in)
+    st.caption(f"Procesado: {len(nuevo_agg):,} filas · {nuevo_agg['fecha'].min().date()} → "
+               f"{nuevo_agg['fecha'].max().date()} · campaña '{camp_in}'.")
+
+    base = st.session_state.get("hist_bytes")
+    if base is not None:
+        maestro = pd.read_csv(io.BytesIO(base))
+        maestro.columns = [c.strip().lower() for c in maestro.columns]
+        if "campana" in maestro.columns:
+            maestro = maestro.rename(columns={"campana": "campaña"})
+        if "campaña" not in maestro.columns:
+            maestro.insert(0, "campaña", camp_in)
+        maestro["fecha"] = pd.to_datetime(maestro["fecha"], errors="coerce").dt.normalize()
+        comb = pd.concat([maestro, nuevo_agg], ignore_index=True)
+    else:
+        comb = nuevo_agg.copy()
     comb["fecha"] = pd.to_datetime(comb["fecha"]).dt.normalize()
-    comb = comb.drop_duplicates(["fecha", "hora", "cola"], keep="last").sort_values(["fecha", "hora", "cola"])
-    st.success(f"Maestro actualizado: {len(comb):,} filas · hasta {comb['fecha'].max().date()} "
-               f"(+{len(comb) - len(maestro):,} filas)")
+    comb = comb.drop_duplicates(["campaña", "fecha", "hora", "cola"], keep="last") \
+               .sort_values(["campaña", "fecha", "hora", "cola"])
+    st.success(f"Histórico listo: {len(comb):,} filas · {comb['campaña'].nunique()} campaña(s) · "
+               f"hasta {comb['fecha'].max().date()}.")
     csv = comb.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Descargar historico.csv actualizado", csv, "historico.csv", "text/csv")
+    st.download_button("⬇️ Descargar historico.csv", csv, "historico.csv", "text/csv")
     st.session_state["hist_bytes"] = csv
-    st.caption("Ya quedó cargado en la sesión: las otras vistas usan el maestro actualizado. "
-               "Igual descárgalo para reemplazar tu copia local.")
+    st.caption("Quedó cargado en la sesión (las otras vistas ya lo usan). Descárgalo para conservarlo tú.")
     st.stop()
 
 
