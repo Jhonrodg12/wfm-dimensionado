@@ -69,7 +69,7 @@ def agregar_crudo(file_bytes):
 
 # ---------------- Selector de vista ----------------
 vista = st.sidebar.radio("Vista", ["Planificación (pronóstico y roster)", "Dashboard histórico",
-                                   "Proyección anual", "Actualizar histórico"])
+                                   "Proyección anual", "Plan de capacidad anual", "Actualizar histórico"])
 
 # Histórico compartido: se sube UNA vez y persiste al cambiar de vista
 _hf = st.sidebar.file_uploader("Histórico único (historico.csv)", type=["csv"], key="hist")
@@ -448,8 +448,13 @@ def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0):
         return s.tail(K).mean()
 
     ini = pd.Timestamp(mes + "-01")
-    win = hh[(hh["fecha"] < ini) & (hh["fecha"] >= ini - pd.Timedelta(weeks=semanas))]
+    fin_datos = hh["fecha"].max()
+    ref = min(ini, fin_datos + pd.Timedelta(days=1))   # no mirar más allá de los datos
+    win = hh[(hh["fecha"] < ref) & (hh["fecha"] >= ref - pd.Timedelta(weeks=semanas))]
     win = win[[not fest(d) for d in win["fecha"]]]
+    if win.empty:
+        win = hh[hh["fecha"] >= fin_datos - pd.Timedelta(weeks=semanas)]
+        win = win[[not fest(d) for d in win["fecha"]]]
     perfil = win.groupby([win["fecha"].dt.dayofweek, "hora"])["vol"].mean().unstack(fill_value=0)
     perfil = perfil.div(perfil.sum(axis=1), axis=0)
 
@@ -578,6 +583,60 @@ def build_excel(S, turnos, params):
     wsg.sheet_view.showGridLines = False
 
     bio = io.BytesIO(); wb.save(bio); return bio.getvalue()
+
+
+# ================== Plan de capacidad anual ==================
+if vista == "Plan de capacidad anual":
+    st.header("👥 Plan de capacidad anual (agentes por mes)")
+    if HIST is None:
+        st.info("Sube el histórico único en la barra lateral.")
+        st.stop()
+    MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+    p1, p2, p3 = st.columns(3)
+    año_cap = int(p1.number_input("Año", 2024, 2030, 2026, 1))
+    scope_cap = p2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
+    K_cap = int(p3.number_input("Semanas promedio", 2, 12, 4, 1))
+    st.caption("Usa los parámetros de la barra lateral (AHT, SLA, OCC, UTL, absentismo…) y los ajustes por mes "
+               "definidos en la Proyección anual. Puede tardar ~1 min la primera vez (dimensiona los 12 meses).")
+    ajuste_mes = st.session_state.get("ajuste_mes", {})
+    filas = []
+    prog = st.progress(0.0, text="Dimensionando meses…")
+    for mth in range(1, 13):
+        mes_str = f"{año_cap}-{mth:02d}"
+        aj = ajuste_mes.get(mth, 0.0)
+        try:
+            Sx = resolver_historico(HIST, mes_str, scope_cap, K_cap, 6,
+                                    AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, aj)
+            presentes = Sx["te"] + Sx["tc"]
+            nomina = math.ceil(presentes / (1 - ABS)) if ABS < 1 else presentes
+            filas.append({"Mes": MESES[mth - 1], "Volumen": Sx["total"], "España": Sx["te"],
+                          "Colombia": Sx["tc"], "Presentes": presentes,
+                          "En nómina": nomina, "Ajuste": f"{int(round(aj * 100)):+d}%"})
+        except Exception as e:
+            filas.append({"Mes": MESES[mth - 1], "Volumen": 0, "España": 0, "Colombia": 0,
+                          "Presentes": 0, "En nómina": 0, "Ajuste": "—"})
+        prog.progress(mth / 12, text=f"Dimensionando {MESES[mth - 1]}…")
+    prog.empty()
+    cap = pd.DataFrame(filas)
+
+    k1, k2, k3 = st.columns(3)
+    pico = cap.loc[cap["En nómina"].idxmax()]
+    k1.metric("Mes pico", f"{pico['Mes']}", f"{int(pico['En nómina'])} en nómina")
+    k2.metric("Promedio en nómina", f"{int(round(cap['En nómina'].mean()))}")
+    k3.metric("Tu plantilla actual", "92", "MULTISKILL")
+    st.dataframe(cap, use_container_width=True)
+
+    x = np.arange(12); w = 0.4
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.bar(x - w / 2, cap["Presentes"], w, label="Presentes (roster)", color="#C9D6D3")
+    ax.bar(x + w / 2, cap["En nómina"], w, label="En nómina (con absentismo)", color="#2A9D8F")
+    ax.axhline(92, color="#E76F51", linestyle="--", linewidth=1, label="Plantilla actual (92)")
+    ax.set_xticks(x); ax.set_xticklabels(cap["Mes"]); ax.set_ylabel("Agentes"); ax.legend()
+    ax.set_title(f"Plantilla necesaria por mes {año_cap}")
+    st.pyplot(fig)
+    st.caption("Presentes = agentes que cubren la operación 24/7 en el roster. "
+               "En nómina = presentes ÷ (1 − absentismo). La línea roja es tu plantilla actual de referencia.")
+    st.stop()
 
 
 # ================== UI ==================
