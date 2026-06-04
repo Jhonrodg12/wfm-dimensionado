@@ -594,6 +594,54 @@ def build_excel(S, turnos, params):
 
 
 # ================== Plan de capacidad anual ==================
+def build_excel_capacidad(cap, año, params, actual=92):
+    FT = "Calibri"
+    HEAD = PatternFill("solid", start_color="1F6F66")
+    HF = Font(name=FT, bold=True, color="FFFFFF")
+    TITLE = Font(name=FT, bold=True, size=14, color="1F6F66")
+    BOLD = Font(name=FT, bold=True); REG = Font(name=FT)
+    wb = Workbook(); ws = wb.active; ws.title = "Plan_Capacidad"
+    ws["A1"] = f"Plan de capacidad anual {año}"; ws["A1"].font = TITLE
+    ws["A2"] = "Parámetros"; ws["A2"].font = BOLD
+    pares = [("AHT", params["AHT"]), ("SLA", params["SLA"]), ("ASA", params["ASA"]), ("OCC", params["OCC"]),
+             ("UTL", params["UTL"]), ("Absentismo", params["ABS"]), ("NDA obj", params["NDA_OBJ"]),
+             ("Plantilla actual", actual)]
+    ws["A3"] = "   ".join(f"{k}={v}" for k, v in pares); ws["A3"].font = REG
+
+    cols = list(cap.columns) + ["Actual"]
+    r0 = 5
+    for j, c in enumerate(cols, start=1):
+        cell = ws.cell(r0, j, c); cell.font = HF; cell.fill = HEAD
+        cell.alignment = Alignment(horizontal="center")
+    colores = {"Real": "E2EFDA", "En curso": "FFF2CC", "Proyectado": "F2F2F2"}
+    for i, (_, row) in enumerate(cap.iterrows(), start=r0 + 1):
+        for j, c in enumerate(cap.columns, start=1):
+            ws.cell(i, j, row[c])
+        ws.cell(i, len(cols), actual)
+        fill = colores.get(row["Estado"])
+        if fill:
+            for j in range(1, len(cols) + 1):
+                ws.cell(i, j).fill = PatternFill("solid", start_color=fill)
+    nf = r0 + len(cap)
+    for j in range(1, len(cols) + 1):
+        ws.column_dimensions[ws.cell(r0, j).column_letter].width = 13
+
+    cP = list(cap.columns).index("Presentes") + 1
+    cN = list(cap.columns).index("En nómina") + 1
+    cA = len(cols)
+    bar = BarChart(); bar.type = "col"; bar.title = f"Plantilla por mes {año}"; bar.height = 8.5; bar.width = 22
+    bar.add_data(Reference(ws, min_col=cP, min_row=r0, max_row=nf), titles_from_data=True)
+    bar.add_data(Reference(ws, min_col=cN, min_row=r0, max_row=nf), titles_from_data=True)
+    bar.set_categories(Reference(ws, min_col=1, min_row=r0 + 1, max_row=nf))
+    ln = LineChart()
+    ln.add_data(Reference(ws, min_col=cA, min_row=r0, max_row=nf), titles_from_data=True)
+    ln.series[0].smooth = False
+    bar += ln
+    ws.add_chart(bar, f"A{nf + 3}")
+    ws.sheet_view.showGridLines = False
+    bio = io.BytesIO(); wb.save(bio); return bio.getvalue()
+
+
 if vista == "Plan de capacidad anual":
     st.header("👥 Plan de capacidad anual (agentes por mes)")
     if HIST is None:
@@ -653,6 +701,11 @@ if vista == "Plan de capacidad anual":
     st.pyplot(fig)
     st.caption("Presentes = agentes que cubren la operación 24/7 en el roster. "
                "En nómina = presentes ÷ (1 − absentismo). La línea roja es tu plantilla actual de referencia.")
+    params_cap = {"AHT": AHT, "SLA": SLA, "ASA": ASA, "OCC": OCC, "UTL": UTL, "ABS": ABS, "NDA_OBJ": NDA_OBJ}
+    st.download_button("⬇️ Descargar plan de capacidad (Excel)",
+                       build_excel_capacidad(cap, año_cap, params_cap),
+                       f"plan_capacidad_{año_cap}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.stop()
 
 
