@@ -47,11 +47,11 @@ def nivel_atencion(ag, carga, aht, pac, NMAX=250):
 
 
 # ---------------- Selector de vista ----------------
-vista = st.sidebar.radio("Vista", ["Planificación (pronóstico y roster)", "Dashboard histórico"])
+vista = st.sidebar.radio("Vista", ["Planificación (pronóstico y roster)", "Dashboard histórico", "Proyección anual"])
 
 if vista == "Dashboard histórico":
     st.header("📊 Dashboard histórico por cola")
-    upd = st.file_uploader("Sube el agregado por cola (CSV: fecha, cola, entrantes, atendidas, abandonadas)",
+    upd = st.file_uploader("Sube tu archivo único (CSV: fecha, hora, cola, entrantes, atendidas, abandonadas)",
                            type=["csv"], key="dash")
     if upd is None:
         st.info("Sube el archivo agregado por cola para ver el dashboard.")
@@ -116,6 +116,76 @@ if vista == "Dashboard histórico":
     ax2.axhline(96, color="#E76F51", linestyle="--", linewidth=1, label="Objetivo 96%")
     ax2.set_ylabel("% Atención"); ax2.legend()
     st.pyplot(fig2)
+
+    if "hora" in f.columns:
+        st.subheader("Por franja horaria")
+        fr = f.groupby("hora")[["entrantes", "atendidas", "abandonadas"]].sum()
+        fr["pat"] = fr["atendidas"] / fr["entrantes"].replace(0, np.nan) * 100
+        fig3, ax3 = plt.subplots(figsize=(10, 3.5))
+        ax3.bar(fr.index, fr["entrantes"], color="#C9D6D3", label="Entrantes")
+        ax3.set_xlabel("Hora"); ax3.set_ylabel("Entrantes"); ax3.set_xticks(range(0, 24, 2))
+        ax3b = ax3.twinx()
+        ax3b.plot(fr.index, fr["pat"], color="#1F6F66", linewidth=2, label="% Atención")
+        ax3b.set_ylabel("% Atención"); ax3b.set_ylim(0, 100)
+        ax3.legend(loc="upper left"); ax3b.legend(loc="upper right")
+        st.pyplot(fig3)
+        st.caption("Barras = entrantes por hora · línea = % atención por hora.")
+    st.stop()
+
+
+if vista == "Proyección anual":
+    st.header("📅 Proyección anual")
+    upa = st.file_uploader("Sube tu archivo único (CSV: fecha, hora, cola, entrantes, …)", type=["csv"], key="anual")
+    if upa is None:
+        st.info("Sube el archivo único para ver la proyección.")
+        st.stop()
+    scope_a = st.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
+    d = pd.read_csv(upa)
+    d.columns = [c.strip().lower() for c in d.columns]
+    d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce")
+    vc = "entrantes" if "entrantes" in d.columns else "vol"
+    d[vc] = pd.to_numeric(d[vc], errors="coerce").fillna(0)
+    d = d.dropna(subset=["fecha"])
+    dia = d.groupby(d["fecha"].dt.normalize())[vc].sum()
+    años = sorted({t.year for t in dia.index})
+    año = st.selectbox("Año a proyectar", años, index=len(años) - 1)
+    if scope_a == "Cataluña (Barcelona)":
+        ES = holidays.Spain(years=range(min(años) - 1, max(años) + 2), subdiv="CT")
+    else:
+        ES = holidays.Spain(years=range(min(años) - 1, max(años) + 2))
+
+    def fest(t):
+        return t.date() in ES
+
+    def proj_dia(t):
+        wd = 6 if fest(t) else t.dayofweek
+        s = dia[(dia.index < t) & (dia.index.dayofweek == wd)]
+        if wd != 6:
+            s = s[[not fest(x) for x in s.index]]
+        return s.tail(4).mean() if len(s) else 0.0
+
+    filas = []
+    for mth in range(1, 13):
+        ini = pd.Timestamp(year=año, month=mth, day=1)
+        fin = ini + pd.offsets.MonthEnd(0)
+        dias_mes = pd.date_range(ini, fin)
+        real = dia[(dia.index >= ini) & (dia.index <= fin)]
+        n_real = real.index.nunique()
+        proy = sum(dia.get(t, proj_dia(t)) for t in dias_mes)
+        estado = "REAL" if n_real >= len(dias_mes) else ("EN CURSO" if n_real > 0 else "PROYECTADO")
+        filas.append({"Mes": ini.strftime("%b"), "Estado": estado,
+                      "Real a la fecha": int(real.sum()), "Proyectado mes": int(round(proy))})
+    tab = pd.DataFrame(filas)
+    c1, c2 = st.columns(2)
+    c1.metric(f"Proyección total {año}", f"{int(tab['Proyectado mes'].sum()):,}")
+    c2.metric("Real acumulado", f"{int(tab['Real a la fecha'].sum()):,}")
+    st.dataframe(tab, use_container_width=True)
+    cores = {"REAL": "#2A9D8F", "EN CURSO": "#E9C46A", "PROYECTADO": "#C9D6D3"}
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.bar(tab["Mes"], tab["Proyectado mes"], color=[cores[e] for e in tab["Estado"]])
+    ax.set_ylabel("Llamadas"); ax.set_title(f"Volumen mensual {año} (real + proyectado)")
+    st.pyplot(fig)
+    st.caption("Verde = mes real · Amarillo = mes en curso · Gris = proyectado.")
     st.stop()
 
 
@@ -214,15 +284,17 @@ def largo_desde_crosstab(file_bytes):
 
 
 def largo_desde_historico(file_bytes, mes, scope, K, semanas):
-    # Histórico AGREGADO y liviano (CSV: fecha, hora, vol)
+    # Archivo ÚNICO (CSV: fecha, hora, cola, entrantes, atendidas, abandonadas)
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.strip().lower() for c in df.columns]
     df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
     df["hora"] = pd.to_numeric(df["hora"], errors="coerce")
-    df["vol"] = pd.to_numeric(df["vol"], errors="coerce").fillna(0)
+    volcol = "entrantes" if "entrantes" in df.columns else "vol"
+    df[volcol] = pd.to_numeric(df[volcol], errors="coerce").fillna(0)
     df = df.dropna(subset=["fecha", "hora"])
     df["hora"] = df["hora"].astype(int)
-    hh = df[["fecha", "hora", "vol"]]
+    hh = df.groupby(["fecha", "hora"])[volcol].sum().reset_index()
+    hh.columns = ["fecha", "hora", "vol"]
     dia = hh.groupby("fecha")["vol"].sum()
 
     if scope == "Cataluña (Barcelona)":
@@ -380,9 +452,9 @@ modo = st.radio("¿Cómo obtenemos el pronóstico?",
 
 S = None
 if modo == "Generar desde histórico":
-    up = st.file_uploader("Sube tu histórico agregado (CSV con columnas: fecha, hora, vol)", type=["csv"])
-    st.caption("¿No tienes el agregado? Genéralo una vez en Colab a partir del histórico crudo "
-               "(suma de Entrantes por fecha y hora). El archivo crudo de 95 MB es demasiado pesado para la web.")
+    up = st.file_uploader("Sube tu archivo único (CSV: fecha, hora, cola, entrantes, atendidas, abandonadas)", type=["csv"])
+    st.caption("Es el mismo archivo que alimenta el Dashboard y la Proyección anual. Se genera una vez en Colab "
+               "a partir del histórico crudo (el de 95 MB es demasiado pesado para la web).")
     c1, c2, c3, c4 = st.columns(4)
     mes = c1.text_input("Mes (AAAA-MM)", "2026-06")
     scope = c2.selectbox("Festivos", ["Nacional España", "Cataluña (Barcelona)"])
