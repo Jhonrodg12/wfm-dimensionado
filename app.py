@@ -77,6 +77,17 @@ if _hf is not None:
     st.session_state["hist_bytes"] = _hf.getvalue()
 HIST = st.session_state.get("hist_bytes")
 
+# Selector de campaña (si el archivo trae la columna 'campaña')
+CAMPANA = None
+if HIST is not None:
+    _full = pd.read_csv(io.BytesIO(HIST))
+    _full.columns = [c.strip().lower() for c in _full.columns]
+    ccol = "campaña" if "campaña" in _full.columns else ("campana" if "campana" in _full.columns else None)
+    if ccol:
+        camps = sorted(_full[ccol].dropna().astype(str).unique())
+        CAMPANA = st.sidebar.selectbox("Campaña", camps)
+        HIST = _full[_full[ccol].astype(str) == CAMPANA].drop(columns=[ccol]).to_csv(index=False).encode()
+
 if vista == "Dashboard histórico":
     st.header("📊 Dashboard histórico por cola")
     if HIST is None:
@@ -336,10 +347,13 @@ ESP_MAX = st.sidebar.number_input("Agentes España (máx, solo L–V)", 0, 200, 
 LARGO = int(st.sidebar.number_input("Duración turno (h)", 6, 12, 9, 1))
 NDA_OBJ = st.sidebar.slider("NDA objetivo (nivel de atención)", 0.80, 0.999, 0.96, 0.005)
 PACIENCIA = st.sidebar.number_input("Paciencia media (seg)", 20, 600, 90, 10)
+EST_OPC = {"España (L-V) + Colombia (24/7)": "mixto", "Solo 24/7 (un país)": "flex", "Solo L-V (fijo)": "fijo"}
+ESTRUCTURA = EST_OPC[st.sidebar.selectbox("Estructura de turnos", list(EST_OPC))]
+PLANTILLA_ACT = int(st.sidebar.number_input("Plantilla actual (referencia)", 0, 2000, 92, 1))
 
 
 # ---------------- Núcleo: dimensionar + roster ----------------
-def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA):
+def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, estructura="mixto"):
     largo = largo.copy()
     largo["dow"] = pd.to_datetime(largo["fecha"]).dt.dayofweek
     volmax = {dw: [0.0] * 24 for dw in range(7)}
@@ -365,20 +379,35 @@ def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PA
 
     H = 24
     turnos = {ini: [(ini + k) % H for k in range(LARGO)] for ini in range(H)}
+    tiene_flex = estructura in ("mixto", "flex")   # pool 24/7 (rotación findes)
+    tiene_fijo = estructura in ("mixto", "fijo")   # pool fijo L-V
     m = cp_model.CpModel()
-    xc = {(t, p): m.NewIntVar(0, 300, f"c{t}_{p}") for t in turnos for p in range(7)}
-    xe = {t: m.NewIntVar(0, 300, f"e{t}") for t in turnos}
+    xc = {(t, p): m.NewIntVar(0, 300, f"c{t}_{p}") for t in turnos for p in range(7)} if tiene_flex else {}
+    xe = {t: m.NewIntVar(0, 300, f"e{t}") for t in turnos} if tiene_fijo else {}
+    weekend_sin_cubrir = 0
     for dw in range(7):
         for h in range(H):
-            col = sum(xc[(t, p)] for t in turnos for p in range(7) if dw not in LIBRES[p] and h in turnos[t])
-            esp = sum(xe[t] for t in turnos if dw not in LIBRES[5] and h in turnos[t])
-            m.Add(col + esp >= peak[dw][h])
-    m.Add(sum(xe.values()) <= int(ESP_MAX))
-    m.Minimize(sum(xc.values()) * 100 - sum(xe.values()))
+            req = peak[dw][h]
+            if req <= 0:
+                continue
+            if not tiene_flex and dw in (5, 6):
+                weekend_sin_cubrir += req   # solo pool fijo L-V: nadie cubre el finde
+                continue
+            col = sum(xc[(t, p)] for t in turnos for p in range(7) if dw not in LIBRES[p] and h in turnos[t]) if tiene_flex else 0
+            esp = sum(xe[t] for t in turnos if dw not in LIBRES[5] and h in turnos[t]) if tiene_fijo else 0
+            m.Add(col + esp >= req)
+    if estructura == "mixto":
+        m.Add(sum(xe.values()) <= int(ESP_MAX))
+    objetivo = 0
+    if tiene_flex:
+        objetivo = objetivo + sum(xc.values()) * 100
+    if tiene_fijo:
+        objetivo = objetivo + (-sum(xe.values()) if estructura == "mixto" else sum(xe.values()))
+    m.Minimize(objetivo)
     sv = cp_model.CpSolver(); sv.Solve(m)
 
-    xe_s = {str(t): sv.Value(xe[t]) for t in turnos if sv.Value(xe[t]) > 0}
-    xc_s = {f"{t}_{p}": sv.Value(xc[(t, p)]) for t in turnos for p in range(7) if sv.Value(xc[(t, p)]) > 0}
+    xe_s = {str(t): sv.Value(xe[t]) for t in xe if sv.Value(xe[t]) > 0}
+    xc_s = {f"{t}_{p}": sv.Value(xc[(t, p)]) for (t, p) in xc if sv.Value(xc[(t, p)]) > 0}
     te = sum(xe_s.values()); tc = sum(xc_s.values())
 
     def crew(req):
@@ -389,10 +418,11 @@ def dimension_roster(largo, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PA
         mm.Minimize(sum(xx.values()))
         ss = cp_model.CpSolver(); ss.Solve(mm)
         return sum(ss.Value(v) for v in xx.values())
-    cw = max(crew(peak[5]), crew(peak[6]))
+    cw = max(crew(peak[5]), crew(peak[6])) if tiene_flex else 0
     vals = [nda[dw][h] for dw in range(7) for h in range(24) if peak[dw][h] > 0]
     return {"peak": peak, "occ": occ, "nda": nda, "nda_min": min(vals) if vals else 1.0,
-            "xe": xe_s, "xc": xc_s, "te": te, "tc": tc,
+            "xe": xe_s, "xc": xc_s, "te": te, "tc": tc, "estructura": estructura,
+            "weekend_sin_cubrir": weekend_sin_cubrir,
             "crew": cw, "rot": cw * 4 // 2, "total": int(largo["volumen"].sum())}
 
 
@@ -476,14 +506,14 @@ def largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste=0.0, mixto=
 
 
 @st.cache_data(show_spinner="Dimensionando y optimizando…")
-def resolver_crosstab(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA):
-    return dimension_roster(largo_desde_crosstab(file_bytes), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
+def resolver_crosstab(file_bytes, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, estructura="mixto"):
+    return dimension_roster(largo_desde_crosstab(file_bytes), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, estructura)
 
 
 @st.cache_data(show_spinner="Pronosticando, dimensionando y optimizando…")
-def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ajuste=0.0, mixto=False):
+def resolver_historico(file_bytes, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ajuste=0.0, mixto=False, estructura="mixto"):
     return dimension_roster(largo_desde_historico(file_bytes, mes, scope, K, semanas, ajuste, mixto),
-                            AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
+                            AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, estructura)
 
 
 def turnos_dict(largo):
@@ -671,7 +701,7 @@ if vista == "Plan de capacidad anual":
         estado = "Real" if nr >= len(dm) else ("En curso" if nr > 0 else "Proyectado")
         try:
             Sx = resolver_historico(HIST, mes_str, scope_cap, K_cap, 6,
-                                    AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, aj, usar_mixto)
+                                    AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, aj, usar_mixto, ESTRUCTURA)
             presentes = Sx["te"] + Sx["tc"]
             nomina = math.ceil(presentes / (1 - ABS)) if ABS < 1 else presentes
             filas.append({"Mes": MESES[mth - 1], "Estado": estado, "Volumen": Sx["total"], "España": Sx["te"],
@@ -688,14 +718,14 @@ if vista == "Plan de capacidad anual":
     pico = cap.loc[cap["En nómina"].idxmax()]
     k1.metric("Mes pico", f"{pico['Mes']}", f"{int(pico['En nómina'])} en nómina")
     k2.metric("Promedio en nómina", f"{int(round(cap['En nómina'].mean()))}")
-    k3.metric("Tu plantilla actual", "92", "MULTISKILL")
+    k3.metric("Tu plantilla actual", f"{PLANTILLA_ACT}", "referencia")
     st.dataframe(cap, use_container_width=True)
 
     x = np.arange(12); w = 0.4
     fig, ax = plt.subplots(figsize=(11, 4))
     ax.bar(x - w / 2, cap["Presentes"], w, label="Presentes (roster)", color="#C9D6D3")
     ax.bar(x + w / 2, cap["En nómina"], w, label="En nómina (con absentismo)", color="#2A9D8F")
-    ax.axhline(92, color="#E76F51", linestyle="--", linewidth=1, label="Plantilla actual (92)")
+    ax.axhline(PLANTILLA_ACT, color="#E76F51", linestyle="--", linewidth=1, label=f"Plantilla actual ({PLANTILLA_ACT})")
     ax.set_xticks(x); ax.set_xticklabels(cap["Mes"]); ax.set_ylabel("Agentes"); ax.legend()
     ax.set_title(f"Plantilla necesaria por mes {año_cap}")
     st.pyplot(fig)
@@ -703,7 +733,7 @@ if vista == "Plan de capacidad anual":
                "En nómina = presentes ÷ (1 − absentismo). La línea roja es tu plantilla actual de referencia.")
     params_cap = {"AHT": AHT, "SLA": SLA, "ASA": ASA, "OCC": OCC, "UTL": UTL, "ABS": ABS, "NDA_OBJ": NDA_OBJ}
     st.download_button("⬇️ Descargar plan de capacidad (Excel)",
-                       build_excel_capacidad(cap, año_cap, params_cap),
+                       build_excel_capacidad(cap, año_cap, params_cap, PLANTILLA_ACT),
                        f"plan_capacidad_{año_cap}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.stop()
@@ -735,13 +765,13 @@ if modo == "Generar desde histórico":
         st.info("Sube el histórico único en la barra lateral.")
     else:
         try:
-            S = resolver_historico(HIST, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ajuste_mes)
+            S = resolver_historico(HIST, mes, scope, K, semanas, AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ajuste_mes, False, ESTRUCTURA)
         except Exception as e:
             st.error(f"No pude procesar el histórico: {e}")
 else:
     up = st.file_uploader("Sube tu pronóstico (días en columnas, intervalos en filas)", type=["xlsx", "xls"])
     if up is not None:
-        S = resolver_crosstab(up.getvalue(), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA)
+        S = resolver_crosstab(up.getvalue(), AHT, SLA, ASA, OCC, UTL, ESP_MAX, LARGO, NDA_OBJ, PACIENCIA, ESTRUCTURA)
 
 if S is None:
     st.info("Sube el archivo para continuar.")
@@ -750,13 +780,24 @@ if S is None:
 turnos = turnos_dict(LARGO)
 
 st.subheader("2) Plantilla requerida")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("España (L–V)", S["te"])
-c2.metric("Colombia", S["tc"])
-c3.metric("TOTAL presentes", S["te"] + S["tc"])
-c4.metric("En nómina (+absentismo)", math.ceil((S["te"] + S["tc"]) / (1 - ABS)))
-st.caption(f"Volumen del mes: {S['total']:,} llamadas · Rotación findes Colombia: cuadrilla {S['crew']}/finde, "
-           f"{S['rot']} en rotación (2 grupos de {S['crew']}, máx. 2 findes/mes).")
+if ESTRUCTURA == "mixto":
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("España (L–V)", S["te"]); c2.metric("Colombia (24/7)", S["tc"])
+    c3.metric("TOTAL presentes", S["te"] + S["tc"])
+    c4.metric("En nómina (+absentismo)", math.ceil((S["te"] + S["tc"]) / (1 - ABS)))
+else:
+    pres = S["te"] + S["tc"]
+    etiqueta = "Agentes L–V" if ESTRUCTURA == "fijo" else "Agentes 24/7"
+    c1, c2 = st.columns(2)
+    c1.metric(f"{etiqueta} (presentes)", pres)
+    c2.metric("En nómina (+absentismo)", math.ceil(pres / (1 - ABS)))
+st.caption(f"Volumen del mes: {S['total']:,} llamadas.")
+if S.get("crew"):
+    st.caption(f"Rotación findes: cuadrilla {S['crew']}/finde, {S['rot']} en rotación "
+               f"(2 grupos de {S['crew']}, máx. 2 findes/mes).")
+if S.get("weekend_sin_cubrir"):
+    st.warning(f"Estructura 'Solo L–V': hay demanda en fines de semana que nadie cubre "
+               f"(~{S['weekend_sin_cubrir']} agentes-hora en pico). Si esta campaña atiende findes, usa 'Solo 24/7'.")
 st.caption(f"NDA previsto (nivel de atención): mínimo {S['nda_min']:.1%} · objetivo {NDA_OBJ:.0%}. "
            f"El tope de OCC ya garantiza un NDA alto; solo aprieta en horas de muy bajo volumen.")
 
